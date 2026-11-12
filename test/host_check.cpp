@@ -29,6 +29,7 @@ static void test_acl_eviction() {
     pub(p, 9);
     AclEntry* n = acl_add(p);
     assert(n && n->pub[0] == 9 && n->last_ts == 0 && n->perms == 0);
+    assert(n->out_path_len == ACL_OUT_PATH_UNKNOWN);   // no route known yet → flood
     pub(p, 1); assert(acl_by_pub(p));    // admin kept
     pub(p, 2); assert(!acl_by_pub(p));   // oldest guest evicted
 }

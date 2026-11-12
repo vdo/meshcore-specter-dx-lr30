@@ -110,7 +110,6 @@ static bool     nf_initial_done        = false;
 uint32_t stat_rx     = 0;   // valid packets received from radio
 uint32_t stat_relay  = 0;   // packets successfully relayed
 uint32_t stat_drop   = 0;   // packets rejected (dedup/hops/malformed)
-uint32_t stat_advert = 0;   // adverts transmitted
 
 // ─── Pin definitions ─────────────────────────────────────────────────────────
 #define PIN_NSS   PA4
@@ -142,9 +141,6 @@ uint32_t stat_advert = 0;   // adverts transmitted
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
 #define FIRST_ADVERT_MS        5000UL                   // 5 s after boot
-#define DISCOVERY_BURST        5                        // zero-hop adverts
-#define DISCOVERY_INTERVAL_MS  1000UL
-#define DUTY_SILENCE_MAX_MS    30000UL
 
 // ─── Node identity ────────────────────────────────────────────────────────────
 // Default: auto-generated name "SPECTER-XXXX" (in prefs defaults) + key
@@ -161,6 +157,7 @@ uint8_t own_pubkey[32];
 static uint8_t own_x25519_key[32];  // mesh-admin scalar = SHA512(own_privkey)[0:32] clamped
 static uint8_t own_hash;     // 1-byte path hash = own_pubkey[0]
 
+#ifdef FIXED_PRIVKEY_HEX
 // ── Compile-time hex → bytes helper (constexpr-friendly for a macro) ─────────
 static void hex2bin(const char* hex, uint8_t* out, int len) {
     for (int i = 0; i < len; i++) {
@@ -171,6 +168,7 @@ static void hex2bin(const char* hex, uint8_t* out, int len) {
         out[i] = (hi << 4) | lo;
     }
 }
+#endif
 
 static void identity_init(void) {
     // If auto-generated placeholder name, replace with UID-based one
@@ -263,7 +261,6 @@ static void short_fp(const uint8_t* payload, uint8_t ptype, uint8_t plen, char* 
 // Hex dump a buffer (up to `max` bytes) to the LOCAL USB console only (not the
 // remote log ring), 16 bytes/line, to inspect a dropped / unexpected packet.
 static void hex_dump(const uint8_t* buf, int len, int max) {
-    if (!serial_is_active()) return;
     if (len > max) len = max;
     for (int off = 0; off < len; off += 16) {
         static char hb[48];
@@ -295,8 +292,7 @@ static void led_blink(uint8_t n, uint16_t ms) {
 // ─── Build-time Unix timestamp (clock base at boot) ─────────────────────────
 // BUILD_EPOCH comes from platformio.ini (-D BUILD_EPOCH=$UNIX_TIME): real UTC.
 // (The old __DATE__/__TIME__ parse used the compiler's LOCAL time as if it were
-// UTC, so the clock started ahead by the build machine's UTC offset — and since
-// the clock never goes backwards, `time` couldn't correct it.)
+// UTC, so the clock started ahead by the build machine's UTC offset.)
 // Re-sync at runtime with `time <epoch>` (USB) or `clock sync` (mesh admin).
 #ifndef BUILD_EPOCH
 #error "BUILD_EPOCH not set: add -D BUILD_EPOCH=$UNIX_TIME to build_flags"
@@ -337,8 +333,11 @@ static uint32_t bkp_restore_time(void) {
 // ─── RadioLib object ─────────────────────────────────────────────────────────
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI);
 
-static uint32_t radio_airtime_ms = 200;   // estimated, set in radio_init()
 static bool     radio_ok         = false; // radio_init() has succeeded
+static bool     rx_started       = false; // radio armed in RX (false → startReceive next loop)
+static uint32_t toa255_ms        = 2000;  // airtime of a 255 B packet  (set in radio_init)
+static uint32_t preamble_ms      = 50;    // preamble+header airtime  (set in radio_init)
+static uint32_t max_pkt_ms       = 4000;  // airtime of a 255 B packet (set in radio_init)
 static uint32_t last_radio_retry = 0;     // degraded-mode retry timer
 
 // ─── Token-bucket RF duty cycle (matches the MeshCore Dispatcher) ────────────
@@ -352,12 +351,13 @@ static uint32_t tx_budget_ms       = 0;   // available airtime budget (ms)
 static uint32_t last_budget_update = 0;   // last refill timestamp (ms)
 
 // ─── DIO1 interrupt flag ─────────────────────────────────────────────────────
-// Set by the DIO1 ISR when the radio raises an interrupt (RxDone).
-// The main loop polls this flag instead of continuously reading getIrqFlags().
-static volatile bool rx_flag = false;
+// Set by the DIO1 ISR: RxDone while receiving, TxDone while transmitting (the
+// same pin — official RadioLibWrapper setFlag). The loop reads it as TX-done when
+// tx_active, else as RX-done, and otherwise sleeps in __WFI().
+static volatile bool dio1_flag = false;
 
 static void on_dio1(void) {
-    rx_flag = true;
+    dio1_flag = true;
 }
 
 static bool radio_init(void) {
@@ -375,7 +375,7 @@ static bool radio_init(void) {
     // which clips output above ~17 dBm. MeshCore uses 140 mA (SX126X_CURRENT_LIMIT).
     radio.setCurrentLimit(140.0);
     radio.setCRC(2);   // CRC-16 on
-    radio.setDio1Action(on_dio1);   // DIO1 (PC15) fires on RxDone → sets rx_flag
+    radio.setDio1Action(on_dio1);   // DIO1 (PC15) fires on RxDone / TxDone → dio1_flag
     // RX gain (reg 0x08AC): 0x96 boosted / 0x94 power-saving. The driver leaves
     // this at the chip's reset default unless told otherwise; the official
     // firmware explicitly drives it to power-saving ('off'). We match that by
@@ -383,12 +383,13 @@ static bool radio_init(void) {
     // trip RxDone and pull the CPU out of __WFI().
     radio.setRxBoostedGainMode(cfg.rxgain != 0);
 
-    // Estimate worst-case on-air time for duty-cycle enforcement:
-    // symbol time = 2^sf / bw; ~160 symbols covers preamble + ~50 B payload
-    float sym_ms = (float)(1UL << (cfg.sf & 0x0F)) / bw_khz;
-    radio_airtime_ms = (uint32_t)(sym_ms * 160.0f) + 50;
-    if (radio_airtime_ms < 50)  radio_airtime_ms = 50;
-    if (radio_airtime_ms > 2000) radio_airtime_ms = 2000;
+    // Listen-before-talk timeouts (official calcMaxPacketMillis): how long a
+    // latched preamble / valid header may mean "channel busy" before it's stale.
+    uint32_t tsym_us = (10000UL << (cfg.sf & 0x0F)) / cfg.bw_tenth;
+    uint32_t sf_x4   = (cfg.sf <= 6) ? 25 : 17;          // sync word + SFD
+    preamble_ms = ((((uint32_t)LORA_PREAMBLE + 8) * 4 + sf_x4) * tsym_us / 4 + 999) / 1000;
+    toa255_ms   = (uint32_t)(radio.getTimeOnAir(255) / 1000);
+    max_pkt_ms  = toa255_ms * 8 / cfg.cr;   // a sender may use CR 4/8
     return true;
 }
 
@@ -460,10 +461,12 @@ static int build_advert(uint8_t* buf, bool zero_hop) {
 // "basic" line) and no RTC (millis() is uptime, identical across nodes at the
 // same uptime), so seed an LCG from the unique 96-bit STM32 UID — each chip gets
 // a different sequence, so simultaneous retransmissions diverge.
-// relay_delay_x10: set by process_pkt — the txdelay factor (x10) for a flood
-// relay, direct.txdelay for a direct/trace relay. Original packets use 0.
+// relay_delay_x10 / relay_pri: set by process_pkt for the relay it returns —
+// txdelay (flood) or direct.txdelay (direct/trace), and the official queue
+// priority (direct 0, flood = new hop count, trace 5).
 static uint32_t rng_state       = 1;
 static uint8_t  relay_delay_x10 = 0;
+static uint8_t  relay_pri       = 0;
 static void rng_seed_uid(void) {
     const uint32_t uid[3] = {
         *(volatile uint32_t*)0x1FFFF7E8U,
@@ -484,39 +487,20 @@ static uint32_t rng_range(uint32_t max) {   // [0, max)
 // ─── Token-bucket duty-cycle helpers ────────────────────────────────────────
 // Refill the budget for the elapsed time since the last update.
 // Integer fixed-point (no float); 64-bit intermediates for the window math.
+// Called every loop pass while a TX is pending, so elapsed is often 1-2 ms:
+// only the time actually converted into budget is consumed from the clock (the
+// remainder carries over), otherwise 1 ms x 10 % = 0 would never refill.
+static bool duty_limited(void) { return cfg.dutycycle > 0 && cfg.dutycycle < 100; }
 static void updateTxBudget(void) {
     uint32_t now = millis();
+    if (!duty_limited()) { last_budget_update = now; return; }
     uint32_t elapsed = now - last_budget_update;
-    if (elapsed == 0) return;
-    if (cfg.dutycycle > 0 && cfg.dutycycle < 100) {
-        tx_budget_ms += (uint32_t)(((uint64_t)elapsed * cfg.dutycycle) / 100);
-        uint32_t max_budget = (uint32_t)(((uint64_t)DUTY_WINDOW_MS * cfg.dutycycle) / 100);
-        if (tx_budget_ms > max_budget) tx_budget_ms = max_budget;
-    }
-    last_budget_update = now;
-}
-
-// Block (keeping the watchdog + CLI alive) until the budget covers `airtime` ms,
-// capped at DUTY_SILENCE_MAX_MS so a pathological setting can't hang the node.
-static void duty_wait(uint32_t airtime) {
-    if (cfg.dutycycle <= 0 || cfg.dutycycle >= 100) return;   // unlimited
-    uint32_t waited = 0;
-    while (tx_budget_ms < airtime && waited < DUTY_SILENCE_MAX_MS) {
-        uint32_t needed = airtime - tx_budget_ms;
-        uint32_t step   = (uint32_t)(((uint64_t)needed * 100) / cfg.dutycycle); // wall-ms to refill
-        if (step < 20)  step = 20;
-        if (step > 500) step = 500;      // poll in ≤500 ms slices
-        uint32_t t0 = millis();
-        while (millis() - t0 < step) { IWatchdog.reload(); cli_poll(); delay(10); }
-        waited += step;
-        updateTxBudget();
-    }
-}
-
-// Public accessor for the CLI — refreshes the budget, then reports it
-uint32_t get_tx_budget_ms(void) {
-    updateTxBudget();
-    return tx_budget_ms;
+    uint32_t refill  = (uint32_t)(((uint64_t)elapsed * cfg.dutycycle) / 100);
+    if (refill == 0) return;
+    last_budget_update += (uint32_t)(((uint64_t)refill * 100) / cfg.dutycycle);
+    uint32_t max_budget = (uint32_t)(((uint64_t)DUTY_WINDOW_MS * cfg.dutycycle) / 100);
+    tx_budget_ms += refill;
+    if (tx_budget_ms > max_budget) { tx_budget_ms = max_budget; last_budget_update = now; }
 }
 
 static void slog(const char* fmt, ...);   // fwd: important → log ring + USB
@@ -530,73 +514,151 @@ static int path_hdr_offset(uint8_t header) {
     return (r == ROUTE_TRANSPORT_FLOOD || r == ROUTE_TRANSPORT_DIRECT) ? 5 : 1;
 }
 
-// ─── Send a packet (retransmit delay + token-bucket duty-cycle gating) ───────
-// delay_x10: retransmit delay factor x10 (0 = send now). Random delay in
-// [0, 5 * airtime * factor], as the official getRetransmitDelay /
-// getDirectRetransmitDelay.
-static bool send_pkt(const uint8_t* buf, int len, uint8_t delay_x10) {
-    // TX log (RX/TX correlation): ptype, first 2 payload bytes (dest/src for
-    // admin, pubkey for advert), hop count, fingerprint. If an RX fp later
-    // matches this fp, this packet is coming back to us.
-    int ph = path_hdr_offset(buf[0]);
-    if (len >= ph + 2) {
-        uint8_t ptype    = (buf[0] >> 2) & 0x0F;
-        uint8_t path_hdr = buf[ph];
-        uint8_t hc  = path_hdr & 0x3F;
-        uint8_t hs  = ((path_hdr >> 6) & 0x03) + 1;
-        int  pb  = hc * hs;
+static uint32_t toa_ms(int len) { return (uint32_t)(radio.getTimeOnAir(len) / 1000); }
+
+// Retransmit delay: random in [0, 5 * airtime * factor] (official
+// getRetransmitDelay / getDirectRetransmitDelay; factor = txdelay x10).
+static uint32_t retransmit_delay(int len, uint8_t factor_x10) {
+    uint32_t t = toa_ms(len) * factor_x10 / 10u;
+    return rng_range(5u * t + 1u);
+}
+
+// ─── Outbound queue + non-blocking TX scheduler (official Dispatcher) ─────────
+// Packets are queued with a priority (lower = sooner: direct 0, own flood 1,
+// PATH 2, advert 3, flood relay = hop count, trace 5) and a send-at time. The
+// radio keeps RECEIVING while packets wait (retransmit delay, duty-cycle budget,
+// busy channel) and the CPU sleeps in __WFI() instead of busy-waiting in
+// delay(); TX itself is startTransmit() + DIO1 TxDone, not a blocking poll.
+#define TXQ_LEN 8
+static struct { uint8_t len, pri; uint32_t at; uint8_t buf[255]; } txq[TXQ_LEN];   // len 0 = free
+// Official error-event bits (Dispatcher.h), reported by stats-core / GET_STATS.
+#define ERR_EVENT_FULL            (1 << 0)
+#define ERR_EVENT_CAD_TIMEOUT     (1 << 1)
+#define ERR_EVENT_STARTRX_TIMEOUT (1 << 2)
+static uint16_t err_flags    = 0;
+static bool     tx_active    = false;   // a startTransmit() is in flight
+static uint8_t  tx_route     = 0;
+static uint32_t tx_start_ms  = 0, tx_expiry_ms = 0;
+static uint32_t next_tx_ms   = 0;       // earliest next TX (budget / busy channel)
+static uint32_t busy_start   = 0;       // channel-busy streak start (0 = none)
+static uint32_t act_since    = 0;       // first sight of the current preamble/header
+
+static bool tx_enqueue(const uint8_t* buf, int len, uint8_t pri, uint32_t delay_ms) {
+    if (len <= 0 || len > 255) return false;
+    for (int i = 0; i < TXQ_LEN; i++) {
+        if (txq[i].len) continue;
+        memcpy(txq[i].buf, buf, len);
+        txq[i].len = (uint8_t)len;
+        txq[i].pri = pri;
+        txq[i].at  = millis() + delay_ms;
+        return true;
+    }
+    err_flags |= ERR_EVENT_FULL;   // official: packet pool exhausted → dropped
+    slog("TX queue full");
+    return false;
+}
+static int txq_count(void) { int n = 0; for (int i = 0; i < TXQ_LEN; i++) if (txq[i].len) n++; return n; }
+// Most important due packet (lowest priority, then earliest), or -1.
+static int txq_next_due(uint32_t now) {
+    int best = -1;
+    for (int i = 0; i < TXQ_LEN; i++) {
+        if (!txq[i].len || (int32_t)(now - txq[i].at) < 0) continue;
+        if (best < 0 || txq[i].pri < txq[best].pri ||
+            (txq[i].pri == txq[best].pri && (int32_t)(txq[i].at - txq[best].at) < 0)) best = i;
+    }
+    return best;
+}
+
+// Listen-before-talk (official CustomSX1262::isReceiving): a preamble or valid
+// header latched in the IRQ status means another node is transmitting. Stale
+// flags (noise-triggered preamble, a header whose packet never completed) are
+// cleared after the preamble / max-packet airtime.
+static bool channel_busy(uint32_t now) {
+    const uint32_t ACT = RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED | RADIOLIB_SX126X_IRQ_HEADER_VALID;
+    uint32_t irq = radio.getIrqFlags();
+    if (irq & RADIOLIB_SX126X_IRQ_HEADER_ERR) {
+        radio.clearIrqFlags(ACT | RADIOLIB_SX126X_IRQ_HEADER_ERR | RADIOLIB_SX126X_IRQ_SYNC_WORD_VALID);
+        act_since = 0;
+        return false;
+    }
+    if (!(irq & ACT)) { act_since = 0; return false; }
+    if (!act_since) act_since = now;
+    uint32_t lim = (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) ? max_pkt_ms : preamble_ms;
+    if (now - act_since > lim) {
+        radio.clearIrqFlags(ACT | RADIOLIB_SX126X_IRQ_SYNC_WORD_VALID);
+        act_since = 0;
+        return false;
+    }
+    return true;
+}
+
+// Start the next due packet if budget, timing and channel allow (official
+// Dispatcher::checkSend). Called while receiving.
+static void check_send(uint32_t now) {
+    int idx = txq_next_due(now);
+    if (idx < 0) return;
+
+    if (duty_limited()) {   // need >= half a max-size packet of budget
+        updateTxBudget();
+        uint32_t need = toa255_ms / 2;   // official MIN_TX_BUDGET_AIRTIME_DIV
+        if (tx_budget_ms < need) {
+            next_tx_ms = now + (uint32_t)(((uint64_t)(need - tx_budget_ms) * 100) / cfg.dutycycle);
+            return;
+        }
+    }
+    if ((int32_t)(now - next_tx_ms) < 0) return;
+    if (channel_busy(now)) {
+        if (!busy_start) busy_start = now;
+        if (now - busy_start <= 4000) { next_tx_ms = now + 200; return; }   // retry in 200 ms
+        err_flags |= ERR_EVENT_CAD_TIMEOUT;   // busy > 4 s: radio may be stuck, send anyway
+    }
+    busy_start = 0;
+
+    const uint8_t* buf = txq[idx].buf;
+    int len = txq[idx].len;
+    if (rx_ring_log_enabled()) {   // TX log (RX/TX correlation by fingerprint)
+        int ph = path_hdr_offset(buf[0]);
+        int pb = (buf[ph] & 0x3F) * (((buf[ph] >> 6) & 0x03) + 1);
         if (len >= ph + 1 + pb + 2) {
             const uint8_t* pl = buf + ph + 1 + pb;
             char fp[9];
-            short_fp(pl, ptype, (uint8_t)(len - ph - 1 - pb), fp);
-            dlog("TX p=%d d=%02X s=%02X hc=%d fp=%s", ptype, pl[0], pl[1], (int)hc, fp);
+            short_fp(pl, (buf[0] >> 2) & 0x0F, (uint8_t)(len - ph - 1 - pb), fp);
+            dlog("TX p=%d d=%02X s=%02X hc=%d fp=%s", (buf[0] >> 2) & 0x0F, pl[0], pl[1], buf[ph] & 0x3F, fp);
         }
     }
+    dio1_flag = false;
+    int st = radio.startTransmit(buf, len);   // copies into the radio's buffer
+    tx_route = buf[0] & 0x03;
+    txq[idx].len = 0;                         // slot free again
+    if (st != RADIOLIB_ERR_NONE) { slog("TX start err %d", st); rx_started = false; return; }
+    tx_active    = true;
+    tx_start_ms  = now;
+    tx_expiry_ms = now + toa_ms(len) * 3 / 2;   // official outbound_expiry
+    digitalWrite(PIN_LED, LED_ON);              // LED on while transmitting
+}
 
-    // Estimate this packet's on-air time from its LENGTH (RadioLib's
-    // calculateTimeOnAir uses the live SF/BW/CR/preamble) — matching the
-    // official's getEstAirtimeFor(len). Fall back to the radio_init estimate if
-    // the radio isn't ready yet.
-    uint32_t est_airtime_ms = (uint32_t)(radio.getTimeOnAir(len) / 1000);
-    if (est_airtime_ms == 0) est_airtime_ms = radio_airtime_ms;
-
-    // Retransmit delay (collision avoidance — spreads out retransmissions of
-    // the same packet by different repeaters). Relays only; per-chip RNG.
-    if (delay_x10) {
-        uint32_t t       = est_airtime_ms * delay_x10 / 10u;
-        uint32_t backoff = rng_range(5u * t + 1u);
-        if (backoff > 0) delay(backoff);
-    }
-
-    // Token bucket: ensure the budget covers this TX before transmitting
-    updateTxBudget();
-    duty_wait(est_airtime_ms);
-
-    uint32_t tx0   = millis();
-    int      state = radio.transmit(const_cast<uint8_t*>(buf), len);
-    uint32_t airtime = millis() - tx0;   // actual on-air time
-    // DIO1 also rises on TxDone, so on_dio1() just set rx_flag. Left set, the
-    // next loop would readData() a non-existent packet — RadioLib returns the
-    // buffer, i.e. our own TX bytes cut to the last RX length (the old
-    // "bit-flipped self-pickup"). The official wrapper tracks a TX-wait state
-    // for the same reason.
-    rx_flag = false;
-
-    // Accumulate TX stats (air time + flood/direct counts)
-    stat_tx_air_ms += airtime;
-    {
-        uint8_t route = buf[0] & 0x03;
-        if (route == ROUTE_DIRECT || route == ROUTE_TRANSPORT_DIRECT) stat_sent_direct++;
-        else                                                          stat_sent_flood++;
-    }
-
-    // Consume the measured airtime from the budget
-    if (state == RADIOLIB_ERR_NONE && cfg.dutycycle > 0 && cfg.dutycycle < 100) {
+// TX in flight: finish on TxDone (DIO1) or timeout, account airtime + budget
+// (official Dispatcher::loop outbound block), then go back to RX.
+static void check_tx_done(uint32_t now) {
+    bool done = dio1_flag;
+    if (!done && (int32_t)(now - tx_expiry_ms) <= 0) return;
+    dio1_flag = false;
+    radio.finishTransmit();
+    tx_active  = false;
+    rx_started = false;
+    digitalWrite(PIN_LED, LED_OFF);
+    if (!done) { slog("TX timeout"); return; }
+    uint32_t t = now - tx_start_ms;
+    stat_tx_air_ms += t;
+    if (tx_route == ROUTE_DIRECT || tx_route == ROUTE_TRANSPORT_DIRECT) stat_sent_direct++;
+    else                                                              stat_sent_flood++;
+    if (duty_limited()) {
         updateTxBudget();
-        if (tx_budget_ms > airtime) tx_budget_ms -= airtime;
-        else                        tx_budget_ms = 0;
+        tx_budget_ms = (tx_budget_ms > t) ? tx_budget_ms - t : 0;
+        next_tx_ms = now;
+        if (tx_budget_ms < 100)   // official MIN_TX_BUDGET_RESERVE_MS
+            next_tx_ms += (uint32_t)(((uint64_t)(100 - tx_budget_ms) * 100) / cfg.dutycycle);
     }
-    return (state == RADIOLIB_ERR_NONE);
 }
 
 // ─── Process received flood packet ───────────────────────────────────────────
@@ -611,12 +673,13 @@ static void slog(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     console_log(buf);
-    if (serial_is_active()) Serial1.println(buf);
+    Serial1.println(buf);
 }
-// Verbose diagnostic: local USB console only (NOT the remote log ring). Use for
-// per-packet traces and content dumps.
+// Verbose diagnostic: local USB console only (NOT the remote log ring), and only
+// while `log start` is on — official packet logging is off by default too, and
+// a silent UART keeps the CPU asleep instead of waiting on a 64 B TX buffer.
 static void dlog(const char* fmt, ...) {
-    if (!serial_is_active()) return;
+    if (!rx_ring_log_enabled()) return;
     char buf[80];
     va_list ap;
     va_start(ap, fmt);
@@ -624,48 +687,81 @@ static void dlog(const char* fmt, ...) {
     va_end(ap);
     Serial1.println(buf);
 }
-// Per-packet RX line: always to the USB console (live debug), but into the
-// remote ring only when logging is on (`log start`). Off by default so a busy
-// mesh doesn't flood the ring — matches the official's _logging gate (logRx).
+// Per-packet RX line: USB console + remote ring, only while `log start` is on
+// (official _logging gate, logRx). Off by default.
 static void rxlog(const char* fmt, ...) {
+    if (!rx_ring_log_enabled()) return;
     char buf[72];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (serial_is_active()) Serial1.println(buf);
-    if (rx_ring_log_enabled()) console_log(buf);
+    Serial1.println(buf);
+    console_log(buf);
 }
 
 static uint8_t relay_buf[MAX_PKT];
 static int     relay_len = 0;
 
-// ─── Mesh-admin: build + send a flood reply (encrypted) ──────────────────────
-// Packet = [hdr][path_hdr][dest_hash][src_hash][MAC(2)+AES(data)]. Flooding is
-// fine for confidentiality: only this node and the client derive `secret`.
-static void send_admin_reply(uint8_t ptype, const uint8_t* client_hash, const uint8_t* secret,
-                             const uint8_t* data, int data_len) {
+// Inbound packet context for the admin handlers (set by process_pkt): how the
+// request arrived decides how the reply is routed.
+static struct { bool flood; uint8_t path_hdr; const uint8_t* path; } rx_ctx;
+
+// Official reply delays (simple_repeater): let the request's own flood settle.
+#define SERVER_RESPONSE_DELAY   300
+#define CLI_REPLY_DELAY_MILLIS  600
+
+// ─── Mesh-admin: encrypted reply, routed like the official ──────────────────
+//   path_return (request came by flood): a PATH packet, flooded, carrying the
+//     path the request took + the reply as 'extra' — the client learns the
+//     route to us and answers with its own PATH, giving us out_path.
+//   else out_path known: DIRECT along it (no flood at all).
+//   else: flood.
+// Payload = [dest_hash][src_hash][MAC(2)+AES(data)].
+static void admin_reply(AclEntry* e, uint8_t ptype, const uint8_t* data, int data_len,
+                        bool path_return, uint32_t delay_ms) {
     if (!radio_ok) return;
-    // The official caps MAX_PACKET_PAYLOAD at 184 B (its RX buffer + TX limit),
-    // so a peer drops any packet > 184 B. packet = 6 + round16(data_len) ≤ 184
-    // → data_len ≤ 176 (packet 182 B). Staying under this is required for
-    // one-packet interop with the official companion.
+    static uint8_t plain[MAX_PAYLOAD];
+    static uint8_t b[MAX_PKT];
+    uint8_t ptype_out = ptype;
+    if (path_return) {
+        uint8_t ph = rx_ctx.path_hdr;
+        int pbytes = (ph & 0x3F) * (((ph >> 6) & 0x03) + 1);
+        // official createPathReturn limit: path + extra + 5 <= MAX_COMBINED_PATH (166)
+        if (pbytes + data_len + 5 <= MAX_PAYLOAD - 2 - 16) {
+            int k = 0;
+            plain[k++] = ph;
+            memcpy(plain + k, rx_ctx.path, pbytes); k += pbytes;
+            plain[k++] = ptype;                   // extra_type
+            memcpy(plain + k, data, data_len); k += data_len;
+            data = plain; data_len = k;
+            ptype_out = PAYLOAD_TYPE_PATH;
+        } else {
+            path_return = false;                  // too long for a PATH: plain reply
+        }
+    }
+    // Official MAX_PACKET_PAYLOAD = 184: 4 + round16(data_len) must fit.
     if (data_len > 176) data_len = 176;
-    static uint8_t b[MAX_PKT];   // static: 1 KB stack is too small for this + handlers
+    bool direct = !path_return && e->out_path_len != ACL_OUT_PATH_UNKNOWN;
     int n = 0;
-    b[n++] = (uint8_t)(ROUTE_FLOOD | (ptype << 2));
-    b[n++] = 0x00;                  // path_hdr: hop_count=0, hash_size_code=0
-    b[n++] = *client_hash;          // dest_hash (the client)
+    b[n++] = (uint8_t)((direct ? ROUTE_DIRECT : ROUTE_FLOOD) | (ptype_out << 2));
+    if (direct) {
+        int pb = (e->out_path_len & 0x3F) * (((e->out_path_len >> 6) & 0x03) + 1);
+        b[n++] = e->out_path_len;
+        memcpy(b + n, e->out_path, pb); n += pb;
+    } else {
+        b[n++] = (uint8_t)(rx_ctx.path_hdr & 0xC0);   // flood, 0 hops, request's hash size
+    }
+    int pl0 = n;
+    b[n++] = e->pub[0];             // dest_hash (the client)
     b[n++] = own_hash;              // src_hash (us)
-    mesh_encrypt_then_mac(secret, b + n, data, data_len);   // writes MAC+cipher
-    n += 2 + ((data_len + 15) / 16) * 16;
-    // Mark our own TX as seen (fingerprint = ptype||payload, matching the
-    // official's calculatePacketHash + markSeen). A rebroadcast copy of this
-    // reply that loops back through another repeater carries the same payload
-    // → same fingerprint, so it's deduped here instead of re-relayed, which is
-    // what was producing duplicate replies.
-    dedup_seen(b + 2, ptype, (uint8_t)(n - 2));
-    send_pkt(b, n, 0);              // original packet — no retransmit delay
+    n += mesh_encrypt_then_mac(e->secret, b + n, data, data_len);
+    // Mark our own TX as seen (official markSeen): a copy looping back through
+    // another repeater is deduped instead of re-relayed.
+    dedup_seen(b + pl0, ptype_out, (uint8_t)(n - pl0));
+    uint8_t pri = direct ? (ptype_out == PAYLOAD_TYPE_PATH ? 1 : 0)
+                         : (ptype_out == PAYLOAD_TYPE_PATH ? 2 : 1);
+    tx_enqueue(b, n, pri, delay_ms);
 }
 
 // Decrypted-plaintext buffer shared by the admin handlers (never concurrent).
@@ -737,6 +833,7 @@ static bool handle_anon_req(const uint8_t* pl, int plen) {
     memcpy(e->secret, secret, sizeof(e->secret));
     e->last_ts = their_ts;
     e->last_activity_ms = millis();
+    if (rx_ctx.flood) e->out_path_len = ACL_OUT_PATH_UNKNOWN;   // official: rediscover the route
 
     // login RESPONSE: [ts(4)][RESP_SERVER_LOGIN_OK=0][0][is_admin][perms][rand(4)][ver_level]
     static uint8_t resp[13];
@@ -751,7 +848,8 @@ static bool handle_anon_req(const uint8_t* pl, int plen) {
     resp[10] = e->pub[0];
     resp[11] = e->pub[1];
     resp[12] = 0;                          // FIRMWARE_VER_LEVEL (informational)
-    send_admin_reply(PAYLOAD_TYPE_RESPONSE, sender_pub, secret, resp, sizeof(resp));
+    // Official chooseReplyRoute: flood login → PATH return; direct → out_path or flood.
+    admin_reply(e, PAYLOAD_TYPE_RESPONSE, resp, sizeof(resp), rx_ctx.flood, SERVER_RESPONSE_DELAY);
 
     slog("login %02X %s", e->pub[0], perms == PERM_ADMIN ? "admin" : "guest");
     return true;
@@ -933,7 +1031,7 @@ static bool handle_req(const uint8_t* pl, int plen) {
         memcpy(resp, data, 4);
         RepeaterStats s;
         s.batt_milli_volts       = measure_battery_mv(); // pack voltage (mV)
-        s.curr_tx_queue_len      = 0;                 // no TX queue
+        s.curr_tx_queue_len      = (uint16_t)txq_count();
         s.noise_floor            = stat_noise_floor;
         s.last_rssi              = stat_last_rssi;
         s.n_packets_recv         = stat_rx;
@@ -944,14 +1042,14 @@ static bool handle_req(const uint8_t* pl, int plen) {
         s.n_sent_direct          = stat_sent_direct;
         s.n_recv_flood           = stat_recv_flood;
         s.n_recv_direct          = stat_recv_direct;
-        s.err_events             = 0;                 // no error flags
+        s.err_events             = err_flags;         // official ERR_EVENT_* bits
         s.last_snr               = stat_last_snr_x4;
         s.n_direct_dups          = (uint16_t)stat_direct_dups;
         s.n_flood_dups           = (uint16_t)stat_flood_dups;
         s.total_rx_air_time_secs = stat_rx_air_ms / 1000;
         s.n_recv_errors          = stat_recv_errors;
         memcpy(resp + 4, &s, sizeof(s));
-        send_admin_reply(PAYLOAD_TYPE_RESPONSE, &e->pub[0], e->secret, resp, 4 + sizeof(s));
+        admin_reply(e, PAYLOAD_TYPE_RESPONSE, resp, 4 + sizeof(s), rx_ctx.flood, SERVER_RESPONSE_DELAY);
         e->last_activity_ms = millis();
         e->last_ts = their_ts;
         return true;
@@ -980,7 +1078,7 @@ static bool handle_req(const uint8_t* pl, int plen) {
         }
         memcpy(resp, data, 4);               // reflect the request ts as the tag
         memcpy(resp + 4, lpp, p);
-        send_admin_reply(PAYLOAD_TYPE_RESPONSE, &e->pub[0], e->secret, resp, 4 + p);
+        admin_reply(e, PAYLOAD_TYPE_RESPONSE, resp, 4 + p, rx_ctx.flood, SERVER_RESPONSE_DELAY);
         e->last_activity_ms = millis();
         e->last_ts = their_ts;
         return true;
@@ -1015,7 +1113,7 @@ static bool handle_txt_msg(const uint8_t* pl, int plen) {
 
     // Verbose (USB only): hex dump of the FULL decrypted command text, to expose
     // multi-var / multi-get batches and any non-printable separators.
-    {
+    if (rx_ring_log_enabled()) {
         int tl = (int)strnlen(text, 150);
         if (tl > 64) tl = 64;
         dlog("TXM dec=%d txtlen=%d hex:", len, tl);
@@ -1071,9 +1169,29 @@ static bool handle_txt_msg(const uint8_t* pl, int plen) {
     if (prefix_len) { memcpy(out + o, sess, sess_len); out[o + sess_len] = '|'; o += prefix_len; }
     memcpy(out + o, reply, rlen);
     dlog("TXM reply %d bytes", rlen);
-    send_admin_reply(PAYLOAD_TYPE_TXT_MSG, &e->pub[0], e->secret, out, o + rlen);
+    // Official: CLI replies go DIRECT if out_path is known, else flood (no PATH return).
+    admin_reply(e, PAYLOAD_TYPE_TXT_MSG, out, o + rlen, false, CLI_REPLY_DELAY_MILLIS);
 
     e->last_activity_ms = millis();
+    return true;
+}
+
+// PATH (0x08) to us: payload = [dest][src][MAC+AES(path_len(1) path extra_type extra)].
+// The client's reciprocal path after our PATH return: store it as out_path so
+// replies go DIRECT (official onPeerPathRecv). Returns true if a session
+// decrypted it (ours), false → relay.
+static bool handle_path(const uint8_t* pl, int plen) {
+    if (plen < 2 + 2 + 16) return false;
+    int len = 0;
+    AclEntry* e = session_decrypt(pl[1], pl + 2, plen - 2, &len);
+    if (!e) return false;
+    uint8_t ph = dec_buf[0];
+    int hs = ((ph >> 6) & 0x03) + 1, pb = (ph & 0x3F) * hs;
+    if (hs == 4 || pb > MAX_PATH_SIZE || 1 + pb > len) return true;   // bad encoding
+    memcpy(e->out_path, dec_buf + 1, pb);
+    e->out_path_len = ph;
+    e->last_activity_ms = millis();
+    dlog("PATH from %02X: %d hops", e->pub[0], ph & 0x3F);
     return true;
 }
 
@@ -1092,8 +1210,68 @@ static bool path_contains_own(const uint8_t* path, int hops, uint8_t hash_size) 
     return false;
 }
 
+// ─── Node discovery (official CONTROL packets, zero-hop only) ────────────────
+// discover.neighbors sends one small NODE_DISCOVER_REQ; repeaters in range answer
+// with NODE_DISCOVER_RESP (tag + pubkey) and land in the neighbours list. We also
+// answer other nodes' requests, rate-limited like the official (4 per 2 min).
+#define PAYLOAD_TYPE_CONTROL        0x0B
+#define CTL_TYPE_NODE_DISCOVER_REQ  0x80
+#define CTL_TYPE_NODE_DISCOVER_RESP 0x90
+static uint32_t discover_tag = 0, discover_until_ms = 0;
+static uint32_t disc_win_s = 0;
+static uint8_t  disc_count = 0;
+
+static void send_zero_hop_control(const uint8_t* data, int len, uint32_t delay_ms) {
+    uint8_t b[2 + 6 + 32];
+    b[0] = (uint8_t)(ROUTE_DIRECT | (PAYLOAD_TYPE_CONTROL << 2));
+    b[1] = 0;                                   // zero hop
+    memcpy(b + 2, data, len);
+    dedup_seen(b + 2, PAYLOAD_TYPE_CONTROL, (uint8_t)len);
+    tx_enqueue(b, 2 + len, 0, delay_ms);
+}
+
+void cli_discover_neighbors(void) {
+    uint8_t d[10];
+    d[0] = CTL_TYPE_NODE_DISCOVER_REQ;          // prefix_only = 0
+    d[1] = 1 << ADV_TYPE_REPEATER;              // filter: repeaters
+    discover_tag = rng_next();
+    memcpy(d + 2, &discover_tag, 4);
+    memset(d + 6, 0, 4);                        // since = 0
+    discover_until_ms = millis() + 60000UL;
+    send_zero_hop_control(d, sizeof(d), 0);
+    slog("discover sent");
+}
+
+static void on_control(const uint8_t* pl, int plen, int8_t snr_x4) {
+    uint8_t type = pl[0] & 0xF0;
+    if (type == CTL_TYPE_NODE_DISCOVER_REQ && plen >= 6 && cfg.repeat_en
+        && (pl[1] & (1 << ADV_TYPE_REPEATER))) {
+        uint32_t now_s = uptime_secs();
+        if (now_s - disc_win_s >= 120) { disc_win_s = now_s; disc_count = 0; }
+        if (disc_count >= 4) return;            // rate limit
+        disc_count++;
+        // ponytail: the optional 'since' filter is ignored (we always answer); add a
+        // config-modified timestamp if clients start relying on it.
+        uint8_t r[6 + 32];
+        r[0] = CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_REPEATER;
+        r[1] = (uint8_t)snr_x4;                 // inbound SNR, for the requester
+        memcpy(r + 2, pl + 2, 4);               // their tag
+        memcpy(r + 6, own_pubkey, 32);
+        int rlen = (pl[0] & 1) ? 6 + 8 : 6 + 32;   // prefix_only
+        // official: retransmit delay x4, as many nodes answer at once
+        send_zero_hop_control(r, rlen, retransmit_delay(2 + rlen, cfg.txdelay_x10) * 4);
+    } else if (type == CTL_TYPE_NODE_DISCOVER_RESP && plen >= 6 + 32
+               && (pl[0] & 0x0F) == ADV_TYPE_REPEATER && discover_tag
+               && (int32_t)(millis() - discover_until_ms) < 0
+               && memcmp(pl + 2, &discover_tag, 4) == 0
+               && memcmp(pl + 6, own_pubkey, 32) != 0) {
+        neighbor_add(pl + 6, uptime_secs(), snr_x4);
+    }
+}
+
 static bool process_pkt(const uint8_t* data, int len) {
     relay_delay_x10 = 0;   // set on every relay return
+    relay_pri       = 0;
     if (len < 1) { dlog("Drop: malformed"); return false; }
 
     // Layout: header [transport codes(4), route types 0/3 only] path_hdr path payload
@@ -1123,7 +1301,7 @@ static bool process_pkt(const uint8_t* data, int len) {
     // RX log (RX/TX correlation): ptype, first 2 payload bytes (dest/src for
     // admin, pubkey for advert), hop count, fingerprint. If this fp matches a
     // recent TX fp, our own packet is coming back (self-pickup or a peer echo).
-    if (payload_len >= 2) {
+    if (payload_len >= 2 && rx_ring_log_enabled()) {
         char fp[9];
         short_fp(payload_ptr, ptype, (uint8_t)payload_len, fp);
         dlog("RX p=%d d=%02X s=%02X hc=%d fp=%s", ptype, payload_ptr[0], payload_ptr[1], (int)hop_count, fp);
@@ -1136,6 +1314,12 @@ static bool process_pkt(const uint8_t* data, int len) {
         && (payload_ptr[100] & 0x0F) == ADV_TYPE_REPEATER
         && memcmp(payload_ptr, own_pubkey, 32) != 0) {
         neighbor_add(payload_ptr, uptime_secs(), (int8_t)(radio.getSNR() * 4.0f));
+    }
+
+    // ── CONTROL (direct, payload[0] bit 7): zero-hop only, never relayed ───
+    if (direct && ptype == PAYLOAD_TYPE_CONTROL && (payload_ptr[0] & 0x80)) {
+        if (hop_count == 0) on_control(payload_ptr, payload_len, (int8_t)(radio.getSNR() * 4.0f));
+        return false;
     }
 
     // ── TRACE (direct): payload = tag(4) auth(4) flags(1) hashes[...] ────────
@@ -1162,6 +1346,7 @@ static bool process_pkt(const uint8_t* data, int len) {
         uint32_t tag; memcpy(&tag, payload_ptr, 4);
         slog("Trace %08lX hop %u", (unsigned long)tag, (unsigned)(hop_count + 1));
         relay_delay_x10 = cfg.direct_txdelay_x10;
+        relay_pri       = 5;
         return true;
     }
 
@@ -1170,7 +1355,8 @@ static bool process_pkt(const uint8_t* data, int len) {
     // path is used up (a direct packet still carrying hops belongs to them).
     bool seen = false;   // already run through dedup_seen below
     if ((ptype == PAYLOAD_TYPE_ANON_REQ || ptype == PAYLOAD_TYPE_TXT_MSG ||
-         ptype == PAYLOAD_TYPE_RESPONSE || ptype == PAYLOAD_TYPE_REQ)
+         ptype == PAYLOAD_TYPE_RESPONSE || ptype == PAYLOAD_TYPE_REQ ||
+         ptype == PAYLOAD_TYPE_PATH)
         && payload_len >= 2 && payload_ptr[0] == own_hash && (!direct || hop_count == 0)) {
         dlog("ADM p=%d dst=%02X src=%02X hc=%d", ptype, payload_ptr[0], payload_ptr[1], (int)hop_count);
         // Dedup first: a re-relayed copy of a command looping back through
@@ -1180,8 +1366,12 @@ static bool process_pkt(const uint8_t* data, int len) {
             return false;
         }
         seen = true;
+        rx_ctx.flood    = !direct;            // decides how the reply is routed
+        rx_ctx.path_hdr = path_hdr;
+        rx_ctx.path     = path_ptr;
         bool ours = false;
         if      (ptype == PAYLOAD_TYPE_ANON_REQ) ours = handle_anon_req(payload_ptr, payload_len);
+        else if (ptype == PAYLOAD_TYPE_PATH)     ours = handle_path(payload_ptr, payload_len);
         else if (ptype == PAYLOAD_TYPE_TXT_MSG)  ours = handle_txt_msg(payload_ptr, payload_len);
         else if (ptype == PAYLOAD_TYPE_REQ)      ours = handle_req(payload_ptr, payload_len);
         if (ours) return false;   // for us: never relayed
@@ -1210,6 +1400,7 @@ static bool process_pkt(const uint8_t* data, int len) {
         relay_len += payload_len;
         dlog("Relay direct");
         relay_delay_x10 = cfg.direct_txdelay_x10;
+        relay_pri       = 0;   // routed traffic: highest priority (official)
         return true;
     }
 
@@ -1222,15 +1413,6 @@ static bool process_pkt(const uint8_t* data, int len) {
     if (hop_count >= (cfg.flood_max ? cfg.flood_max : MAX_HOPS) || hop_count >= 63
         || path_bytes + hash_size > MAX_PATH_SIZE) {
         dlog("Drop: max hops"); return false;
-    }
-
-    // PATH (0x08) addressed to us: a returned-path request to us, not relevant
-    // to a repeater. Do NOT relay it — the relay's 300-800 ms CSMA backoff blocks
-    // the main loop right when the app's next command arrives (this is what was
-    // timing out `get lon` in Get Position). Relay p=8 only when NOT addressed to us.
-    if (ptype == PAYLOAD_TYPE_PATH && payload_ptr[0] == own_hash) {
-        dlog("Drop: PATH to us");
-        return false;
     }
 
     // Dedup check
@@ -1269,7 +1451,31 @@ static bool process_pkt(const uint8_t* data, int len) {
 
     dlog("Relay hop=%u", (unsigned)new_hop);
     relay_delay_x10 = cfg.txdelay_x10;   // flood relay → txdelay backoff
+    relay_pri       = new_hop;           // closer sources first (official)
     return true;
+}
+
+// ─── Stats CLI: official StatsFormatHelper JSON (parsed by the official tools) ─
+void format_stats_core(char* b, int n) {
+    snprintf(b, n, "{\"battery_mv\":%u,\"uptime_secs\":%lu,\"errors\":%u,\"queue_len\":%u}",
+             (unsigned)measure_battery_mv(), (unsigned long)uptime_secs(),
+             (unsigned)err_flags, (unsigned)txq_count());
+}
+void format_stats_radio(char* b, int n) {
+    int x = stat_last_snr_x4;                    // SNR x4 → "%.2f" without float printf
+    unsigned a = (unsigned)(x < 0 ? -x : x);
+    snprintf(b, n, "{\"noise_floor\":%d,\"last_rssi\":%d,\"last_snr\":%s%u.%02u,"
+                   "\"tx_air_secs\":%lu,\"rx_air_secs\":%lu}",
+             (int)stat_noise_floor, (int)stat_last_rssi, x < 0 ? "-" : "", a / 4, (a % 4) * 25,
+             (unsigned long)(stat_tx_air_ms / 1000), (unsigned long)(stat_rx_air_ms / 1000));
+}
+void format_stats_packets(char* b, int n) {
+    snprintf(b, n, "{\"recv\":%lu,\"sent\":%lu,\"flood_tx\":%lu,\"direct_tx\":%lu,"
+                   "\"flood_rx\":%lu,\"direct_rx\":%lu,\"recv_errors\":%lu}",
+             (unsigned long)stat_rx, (unsigned long)(stat_sent_flood + stat_sent_direct),
+             (unsigned long)stat_sent_flood, (unsigned long)stat_sent_direct,
+             (unsigned long)stat_recv_flood, (unsigned long)stat_recv_direct,
+             (unsigned long)stat_recv_errors);
 }
 
 // ─── System Clock Configuration (8 MHz HSI, PLL OFF) ──────────────────────
@@ -1411,7 +1617,7 @@ void setup(void) {
         if (saved >= ts_base) ts_base = saved + 1;
     }
     identity_init();
-    rng_seed_uid();   // per-chip retransmit-delay RNG (see send_pkt)
+    rng_seed_uid();   // per-chip retransmit-delay RNG (see retransmit_delay)
     Serial1.println();
     Serial1.print("=== SPECTER MeshCore Repeater v");
     Serial1.print(FW_VERSION);
@@ -1443,13 +1649,20 @@ void setup(void) {
 static uint32_t last_local_advert = 0;
 static uint32_t last_flood_advert = 0;
 static bool     first_advert      = false;
-static bool     rx_started        = false;
 static uint32_t last_beat_ms      = 0;   // LED heartbeat (10 s)
 static uint32_t last_alive_ms     = 0;   // ALIVE log line (60 s)
 static bool     advert_pending    = false;      // CLI-triggered advert
 static bool     advert_zerohop    = false;
-static uint8_t  discovery_burst   = 0;          // zero-hop burst remaining
-static uint32_t last_burst_ms     = 0;
+static bool     led_pulse_on      = false;      // non-blocking LED pulse in progress
+static uint32_t led_off_at        = 0;
+
+// Non-blocking LED pulse (the old led_blink() busy-waited in delay() with the
+// radio deaf). Turned off by loop(); TX keeps the LED on while transmitting.
+static void led_pulse(uint16_t ms) {
+    digitalWrite(PIN_LED, LED_ON);
+    led_off_at   = millis() + ms;
+    led_pulse_on = true;
+}
 
 // ─── Console log ring (declared in config.h, implemented in cli.cpp) ─────────
 // All runtime diagnostics go here instead of straight to serial; the user
@@ -1500,27 +1713,17 @@ const char* cli_version_str(void) {
 }
 
 void cli_send_advert_now(bool zero_hop) {
-    if (zero_hop) {
-        // Immediate zero-hop advert + short discovery burst
-        advert_pending = true;
-        advert_zerohop = true;
-        discovery_burst = DISCOVERY_BURST;
-    } else {
-        advert_pending = true;
-        advert_zerohop = false;
-    }
+    advert_pending = true;
+    advert_zerohop = zero_hop;
 }
 
-// Build, sign and send our advert. zero_hop → neighbours only (not relayed).
-static void send_advert(bool zero_hop, const char* why) {
-    rx_started = false;   // restart RX after TX
+// Build, sign and queue our advert. zero_hop → neighbours only (not relayed).
+// Official priorities: zero-hop 0, flood advert 3 (de-prioritised).
+static void send_advert(bool zero_hop, const char* why, uint32_t delay_ms) {
     uint8_t abuf[MAX_PKT];
     int     alen = build_advert(abuf, zero_hop);
-    stat_advert++;
     slog("ADVERT %s", why);
-    digitalWrite(PIN_LED, LED_ON);
-    send_pkt(abuf, alen, 0);
-    digitalWrite(PIN_LED, LED_OFF);
+    tx_enqueue(abuf, alen, zero_hop ? 0 : 3, delay_ms);
 }
 
 // ─── STOP Mode Manager ──────────────────────────────────────────────────────
@@ -1549,10 +1752,14 @@ void loop(void) {
         return;
     }
 
-    // ── LED heartbeat every 10 s ─────────────────────────────────────────────
+    // ── LED: heartbeat every 10 s + end of a pulse (non-blocking) ────────────
     if (now - last_beat_ms >= 10000UL) {
         last_beat_ms = now;
-        led_blink(1, 50);   // heartbeat blink every 10 s
+        led_pulse(50);
+    }
+    if (led_pulse_on && !tx_active && (int32_t)(now - led_off_at) >= 0) {
+        digitalWrite(PIN_LED, LED_OFF);
+        led_pulse_on = false;
     }
     // ── ALIVE log line every 60 s (keeps the remote log ring uncluttered) ─────
     if (now - last_alive_ms >= 60000UL) {
@@ -1582,15 +1789,9 @@ void loop(void) {
     // ── CLI-triggered advert ─────────────────────────────────────────────────
     if (advert_pending) {
         advert_pending = false;
-        send_advert(advert_zerohop, advert_zerohop ? "zerohop" : "flood");
+        // official: 1.5 s delay so the CLI reply goes out first
+        send_advert(advert_zerohop, advert_zerohop ? "zerohop" : "flood", 1500);
         last_local_advert = now;   // don't double-send right after
-    }
-
-    // ── Discovery burst (discover.neighbors / advert.zerohop) ────────────────
-    if (discovery_burst && (now - last_burst_ms) >= DISCOVERY_INTERVAL_MS) {
-        last_burst_ms = now;
-        discovery_burst--;
-        send_advert(true, "discover");
     }
 
     // ── ADVERT timers (intervals from cfg, MeshCore standard) ────────────────
@@ -1625,66 +1826,70 @@ void loop(void) {
         advert_type = "local";
     }
 
-    if (do_advert) send_advert(advert_zero, advert_type);
+    if (do_advert) send_advert(advert_zero, advert_type, 0);
 
-    // ── Interrupt-driven receive (DIO1/PC15 fires on RxDone) ─────────────────
-    // DIO1 is connected to PC15 on this HW revision, so we use setDio1Action()
-    // (registered in radio_init) instead of polling getIrqFlags(). The ISR sets
-    // rx_flag; here we react to it. startReceive() arms the radio; on RxDone the
-    // ISR fires, we read the packet, and re-arm.
-    if (!rx_started) {
-        int err = radio.startReceive();
-        if (err != RADIOLIB_ERR_NONE) {
-            slog("startReceive err: %d", (int)err);
-        }
-        rx_started = true;
-    }
+    // ── Radio: TX in flight → wait for TxDone; else receive + send ──────────
+    // DIO1 (PC15) wakes the CPU from __WFI() on RxDone / TxDone (dio1_flag).
+    // While a packet waits in the queue the radio stays in RX — nothing here
+    // blocks, so the CPU sleeps between SysTick ticks.
+    if (tx_active) check_tx_done(now);
 
-    if (rx_flag) {
-        rx_flag = false;                      // RxDone
-        uint8_t rxbuf[MAX_PKT];
-        int state = radio.readData(rxbuf, 0);
-        rx_started = false;
-
-        if (state == RADIOLIB_ERR_NONE) {
-            int   rxlen = (int)radio.getPacketLength();
-            float rssi  = radio.getRSSI();
-            float snr   = radio.getSNR();
-            rxlog("RX RSSI=%d SNR=%d len=%d", (int)rssi, (int)snr, (int)rxlen);
-            stat_last_rssi   = (int16_t)rssi;          // last RX signal level
-            stat_last_snr_x4 = (int16_t)(snr * 4.0f);  // last SNR, x4 (keep the fraction)
-            stat_rx_air_ms  += (uint32_t)(radio.getTimeOnAir(rxlen) / 1000);   // per-packet RX air time
-            if (rxlen > 0 && rxlen < MAX_PKT) {
-                stat_rx++;
-                uint8_t route = rxbuf[0] & 0x03;
-                if (route == ROUTE_DIRECT || route == ROUTE_TRANSPORT_DIRECT) stat_recv_direct++;
-                else                                                          stat_recv_flood++;
-                led_blink(1, 20);         // 1 blink = pkt received
-                if (process_pkt(rxbuf, rxlen)) {
-                    stat_relay++;
-                    led_blink(2, 20);     // 2 fast blinks = relay OK
-                    send_pkt(relay_buf, relay_len, relay_delay_x10);
-                } else {
-                    stat_drop++;
-                }
+    if (!tx_active) {
+        if (!rx_started) {
+            // Continuous RX; PREAMBLE_DETECTED latched in the IRQ status (not on
+            // DIO1, so no extra wake-ups) for listen-before-talk — official
+            // CustomSX1262::startReceive.
+            int err = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF,
+                                         RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED),
+                                         RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+            if (err != RADIOLIB_ERR_NONE) {
+                err_flags |= ERR_EVENT_STARTRX_TIMEOUT;
+                slog("startReceive err: %d", (int)err);
             }
-        } else {
-            stat_recv_errors++;   // CRC error or other read failure
-            slog("readData err: %d", (int)state);
+            rx_started = true;
         }
-    }
 
-    // ── Enter SLEEP until next interrupt ─────────────────────────────────────
-    // __WFI() halts the CPU in SLEEP mode until any interrupt fires:
-    //   - SysTick (every 1ms) keeps millis() running → ADVERT/heartbeat timing
-    //     and IWatchdog.reload() still work (loop re-runs each tick)
-    //   - DIO1 (PC15) interrupt wakes on incoming packet → sets rx_flag
-    // This reduces CPU power vs. spinning the loop continuously.
+        if (dio1_flag) {
+            dio1_flag = false;                    // RxDone
+            uint8_t rxbuf[MAX_PKT];
+            int state = radio.readData(rxbuf, 0);
+            rx_started = false;                   // re-arm (official recvRaw)
+
+            if (state == RADIOLIB_ERR_NONE) {
+                int   rxlen = (int)radio.getPacketLength();
+                float rssi  = radio.getRSSI();
+                float snr   = radio.getSNR();
+                rxlog("RX RSSI=%d SNR=%d len=%d", (int)rssi, (int)snr, (int)rxlen);
+                stat_last_rssi   = (int16_t)rssi;          // last RX signal level
+                stat_last_snr_x4 = (int16_t)(snr * 4.0f);  // last SNR, x4 (keep the fraction)
+                stat_rx_air_ms  += toa_ms(rxlen);          // per-packet RX air time
+                if (rxlen > 0 && rxlen < MAX_PKT) {
+                    stat_rx++;
+                    uint8_t route = rxbuf[0] & 0x03;
+                    if (route == ROUTE_DIRECT || route == ROUTE_TRANSPORT_DIRECT) stat_recv_direct++;
+                    else                                                          stat_recv_flood++;
+                    led_pulse(20);                // short pulse = packet received
+                    if (process_pkt(rxbuf, rxlen) &&
+                        tx_enqueue(relay_buf, relay_len, relay_pri,
+                                   retransmit_delay(relay_len, relay_delay_x10))) {
+                        stat_relay++;
+                    } else {
+                        stat_drop++;
+                    }
+                }
+            } else {
+                stat_recv_errors++;   // CRC error or other read failure
+                slog("readData err: %d", (int)state);
+            }
+        }
+
+        check_send(now);
+    }
 
     // ── Noise floor sampling (triggered once per 10 minutes) ───────────────────
     // Instead of polling RSSI over SPI continuously every 200 ms, trigger a brief
     // session of N subsequent samples (100 ms apart) once every 10 minutes.
-    if (rx_started && !nf_session_active) {
+    if (rx_started && !tx_active && !nf_session_active) {
         if (!nf_initial_done && now >= 5000UL) {
             nf_session_active  = true;
             nf_initial_done    = true;
@@ -1703,7 +1908,7 @@ void loop(void) {
         }
     }
 
-    if (nf_session_active && rx_started) {
+    if (nf_session_active && rx_started && !tx_active) {
         if ((now - last_nf_sample_ms) >= NF_BURST_SPACING_MS) {
             last_nf_sample_ms = now;
             nf_attempts++;
@@ -1727,6 +1932,7 @@ void loop(void) {
         }
     }
 
-    // Sleep until next event (8 MHz SLEEP; see the __WFI note above).
+    // Sleep until the next interrupt: SysTick (1 ms, keeps millis() and the
+    // timers above running), DIO1 (RxDone/TxDone) or a UART byte.
     __WFI();
 }

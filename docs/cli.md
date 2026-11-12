@@ -39,9 +39,8 @@ Hardware constraints that shape the subset:
 | 14 | `advert` | op | Trigger a flood ADVERT now (already have `build_advert()`) |
 | 15 | `advert.zerohop` | op | Trigger a zero-hop ADVERT now |
 | 16 | `neighbors` | get | List up to 8 most recent neighbours: `{pubkey[4B-hex]}:{secs_ago}:{snr*4}` newest-first, `-none-` if empty (8-slot cache of other nodes' ADVERTs; own advert excluded) |
-| 17 | `discover.neighbors` | op | Trigger zero-hop discovery burst |
-| 18 | `stats-core` | get (serial) | Uptime, advert counters, relay/drop counters (already tracked) |
-| 19 | `stats-packets` | get (serial) | rx / relay / drop counters (already tracked) |
+| 17 | `discover.neighbors` | op | Official zero-hop NODE_DISCOVER request; repeaters that answer land in `neighbors` |
+| 18 | `stats-core` / `stats-radio` / `stats-packets` | get | Official JSON (see command reference) |
 | 20 | `clock` / `time <epoch>` / `clock sync` | op | Advert timestamps are compile-time base + `millis()` — drifts. `time` lets user re-sync the base; required because advert replay protection rejects `|now-ts| > 3600 s` |
 
 ### Tier 3 — routing / regulatory tuning
@@ -221,8 +220,8 @@ OK
 | `set temp.offset <-12..12>` | `OK` | **admin / local-serial only.** Zero the temp sensor against a reference thermometer (adds the offset to every reading); persists |
 | `get public.key` | 64 hex chars | Ed25519 pubkey |
 | `clock` | epoch seconds | advert timestamp base + uptime |
-| `time <epoch>` | `OK` | re-syncs advert clock forward only (`Err: clock cannot go backwards` otherwise — peers would drop our adverts as replays). Admin over the mesh |
-| `clock sync` | `OK - clock set` | mesh admin only: sets the clock from the admin's message timestamp (forward only), like the official firmware |
+| `time <epoch>` | `OK` | sets the advert clock (forward or backwards). Moving it back: peers ignore our adverts until real time passes the newest timestamp they heard from us. Admin over the mesh |
+| `clock sync` | `OK - clock set` | mesh admin only: sets the clock from the admin's message timestamp (official command; backwards allowed here) |
 | `get name` / `set name <n>` | name / `OK` | 23 B max with location, 31 B without |
 | `get lat` / `set lat <deg>` | `52.520007` / `OK` | ±90°, 6 decimals; `0` = no location in advert |
 | `get lon` / `set lon <deg>` | `13.404954` / `OK` | ±180° |
@@ -235,13 +234,14 @@ OK
 | `get advert.interval` | `90` | zero-hop minutes, 0 (off) or 60–240 |
 | `set advert.interval <m>` | `OK` | values < 60 clamp to 0 (disabled) |
 | `advert` | `OK` | send a flood ADVERT now |
-| `advert.zerohop` | `OK` | zero-hop ADVERT + 5×1 s discovery burst |
+| `advert.zerohop` | `OK - zerohop advert sent` | one zero-hop ADVERT (DIRECT, empty path — neighbours only) |
 | `neighbors` | `AABBCCDD:<secs_ago>:<snr*4>` lines (newest-first) | 8 most recent neighbours heard; `-none-` if empty |
-| `discover.neighbors` | `OK` | discovery burst |
-| `stats-core` | uptime/name/duty/budget/loop | `budget=` = remaining duty-cycle budget (ms) |
-| `stats-packets` | rx/relay/drop/advert counters | |
+| `discover.neighbors` | `OK - Discover sent` | official NODE_DISCOVER_REQ (zero-hop control packet); repeaters that answer within 60 s are added to `neighbors`. SPECTER also answers other nodes' requests (max 4 per 2 min) |
+| `stats-core` | `{"battery_mv":…,"uptime_secs":…,"errors":…,"queue_len":…}` | official JSON. `errors` = official bits: 1 send queue full, 2 channel busy > 4 s, 4 RX start failed |
+| `stats-radio` | `{"noise_floor":…,"last_rssi":…,"last_snr":…,"tx_air_secs":…,"rx_air_secs":…}` | official JSON |
+| `stats-packets` | `{"recv":…,"sent":…,"flood_tx":…,"direct_tx":…,"flood_rx":…,"direct_rx":…,"recv_errors":…}` | official JSON |
 | `log` | last 20 ring lines | read ADVERT/ALIVE/login/error lines (RX is opt-in via `log start`) |
-| `log start` | `logging on` | begin capturing per-packet RX RSSI/SNR/len into the ring (off by default, so a busy mesh doesn't flood it) |
+| `log start` | `logging on` | per-packet logging on: RX lines into the ring + USB, plus the verbose RX/TX/routing trace on USB. Off by default (like the official), which keeps the UART quiet and the CPU asleep |
 | `log stop` | `logging off` | stop capturing RX into the ring |
 | `log clear` | `OK` | empty the diagnostic buffer |
 | `get repeat` / `set repeat on\|off` | `on` / `OK` | relay master switch |
@@ -419,7 +419,7 @@ press *Repeater Status* / *Get Position* in the app. See
   config.
   Implemented commands: `ver`, `board`, `get role`, `reboot`, `erase`,
   `clock`, `time <epoch>`, `advert`, `advert.zerohop`, `neighbors`,
-  `discover.neighbors`, `stats-core`, `stats-packets`, and
+  `discover.neighbors`, `stats-core`, `stats-radio`, `stats-packets`, and
   get/set for: `name`, `lat`, `lon`, `radio`, `freq`, `tx`,
   `flood.advert.interval`, `advert.interval`, `repeat`, `loop.detect`,
   `txdelay`, `direct.txdelay`, `dutycycle`, `flood.max`.

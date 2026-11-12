@@ -4,6 +4,47 @@ All notable changes to SPECTER firmware are documented here.
 
 ## [Unreleased]
 
+### Efficiency / low power (aligned with the official Dispatcher)
+
+- **Send queue + non-blocking TX**: packets are queued with the official
+  priorities (direct 0, own flood 1, PATH 2, advert 3, flood relay = hop count,
+  trace 5) and a send-at time. The radio keeps **receiving** during the retransmit
+  delay, duty-cycle waits and busy-channel retries, and the CPU sleeps in `__WFI()`
+  instead of busy-waiting in `delay()`. TX is `startTransmit()` + DIO1 TxDone
+  instead of a blocking poll. Previously the node was deaf (and the CPU fully
+  awake) for up to ~2× airtime per relay and up to 30 s on a duty-cycle deficit.
+- **Listen-before-talk**: a latched preamble / valid header defers the TX by 200 ms
+  (up to 4 s, then send anyway), as the official `isReceiving()` check.
+- **Duty-cycle gate** now follows the official rules (budget ≥ half a 255 B packet
+  before TX, 100 ms reserve after). The budget refill no longer loses the fraction
+  when updated every millisecond.
+- **Admin replies routed like the official**: a flooded login/request is answered
+  with a PATH return (the client learns the route and sends back its own path);
+  after that, replies go **direct** instead of flooding the whole mesh. Official
+  reply delays (300 ms responses, 600 ms CLI). PATH packets to us are now handled
+  (previously dropped).
+- **discover.neighbors** sends one official NODE_DISCOVER_REQ control packet
+  instead of 5 signed adverts; SPECTER also answers other nodes' discovery
+  requests (rate-limited 4 per 2 min, like the official).
+- **Verbose logging off by default**: the per-packet RX/TX trace and fingerprints
+  (an extra SHA-256 per RX and TX) only run while `log start` is on.
+- **LED is non-blocking** (pulses instead of `delay()` blinks).
+
+### Clock
+
+- `time` and `clock sync` may move the clock **backwards** again (the official
+  forbids it), so a clock that ran ahead can always be corrected. Peers ignore our
+  adverts until real time passes the newest timestamp they heard from us.
+
+### Stats CLI
+
+- `stats-core`, `stats-radio`, `stats-packets` now print the **official JSON**
+  (StatsFormatHelper), so config.meshcore.io and the app can read them.
+  `stats-radio` is new. GET_STATS now reports the real queue length and error
+  flags.
+- Official dotted command names `advert.zerohop` and `discover.neighbors` work
+  (only the space-separated forms did), with the official replies.
+
 ### Fixes (verified against the official MeshCore firmware source)
 
 Security:
@@ -18,7 +59,6 @@ Security:
 - **Session-table lockout**: a full table now evicts the least-recently-active
   non-admin (official `putClient`); the login replay check runs before the entry
   is modified.
-- `time` can no longer move the clock backwards (official rule).
 
 Protocol / routing:
 - **Own TX read back as RX**: DIO1 also fires on TxDone, so after every TX the loop

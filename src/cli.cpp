@@ -69,11 +69,6 @@ static void handle_line(char* raw);   // fwd
 // pair must not dispatch again.
 static bool line_closed = false;
 
-// Serial is always active. (A PA9/PA10 auto-sleep / idle-timeout power feature
-// was tried and reverted: it saved only ~0.12 mA measured — not worth the
-// dropped-first-byte-after-wake snag it introduced. See CHANGELOG.)
-bool serial_is_active(void) { return true; }
-
 void cli_begin(void) {
     line_len = 0;
 }
@@ -347,19 +342,18 @@ static void cmd_time(int argc, char** argv) {
         out("Err: bad epoch");
         return;
     }
-    // Official: the clock never goes backwards — peers would drop our next
-    // adverts as replays (their timestamp would be older than one already seen).
-    if ((uint32_t)v <= cli_now_epoch()) { out("Err: clock cannot go backwards"); return; }
+    // Backwards is allowed (unlike the official) so a wrong clock can always be
+    // fixed. Caveat: peers ignore our adverts until real time passes the newest
+    // timestamp they already heard from us.
     cli_set_time((uint32_t)v);
     out("OK");
 }
 
-// `clock sync` (mesh admin): set our clock from the admin's message timestamp,
-// forward only (official CommonCLI).
+// `clock sync` (mesh admin): set our clock from the admin's message timestamp
+// (official CommonCLI, but backwards allowed, as for `time`).
 static uint32_t cli_sender_ts = 0;
 static void cmd_clock_sync(void) {
     if (cli_sender_ts == 0) { out("Err: clock sync works over the mesh only (use: time <epoch>)"); return; }
-    if (cli_sender_ts <= cli_now_epoch()) { out("Err: clock cannot go backwards"); return; }
     cli_set_time(cli_sender_ts + 1);
     out("OK - clock set");
 }
@@ -367,7 +361,7 @@ static void cmd_clock_sync(void) {
 static void cmd_advert(int argc, char** argv) {
     bool zero_hop = (argc >= 2 && strcmp(argv[1], "zerohop") == 0);
     cli_send_advert_now(zero_hop);
-    out("OK");
+    out(zero_hop ? "OK - zerohop advert sent" : "OK - Advert sent");   // official replies
 }
 
 static void cmd_neighbors(void) {
@@ -400,25 +394,11 @@ static void cmd_neighbors(void) {
     out(buf);
 }
 
-extern uint32_t get_tx_budget_ms(void);
-
-static void cmd_stats_core(void) {
-    char buf[100];
-    snprintf(buf, sizeof(buf), "uptime=%lus name=%s duty=%u%% budget=%lums loop.detect=%s",
-             (unsigned long)uptime_secs(), cfg.name,
-             (unsigned)cfg.dutycycle, (unsigned long)get_tx_budget_ms(),
-             (cfg.loop_detect & 0x03) ? "on" : "off");   // bits [3:2] = path.hash.mode
-    out(buf);
-}
-
-// extern counters from main.cpp
-extern uint32_t stat_rx, stat_relay, stat_drop, stat_advert;
-
-static void cmd_stats_packets(void) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "rx=%lu relay=%lu drop=%lu advert=%lu",
-             (unsigned long)stat_rx, (unsigned long)stat_relay,
-             (unsigned long)stat_drop, (unsigned long)stat_advert);
+// stats-core / stats-radio / stats-packets: the official JSON, byte-for-byte
+// (StatsFormatHelper), so config.meshcore.io and the app can parse them.
+static void cmd_stats(void (*fmt)(char*, int)) {
+    char buf[160];
+    fmt(buf, sizeof(buf));
     out(buf);
 }
 
@@ -823,13 +803,19 @@ static void handle_line(char* raw) {
             done = true;
         }
     }
-    else if (!strcmp(c, "discover")) {
-        if (argc >= 2 && !strcmp(argv[1], "neighbors")) { cli_send_advert_now(true); out("OK"); }
+    // Official names are dotted (advert.zerohop, discover.neighbors); the
+    // space-separated forms are kept for older docs/scripts.
+    else if (!strcmp(c, "advert.zerohop"))                  { cli_send_advert_now(true); out("OK - zerohop advert sent"); done = true; }
+    else if (!strcmp(c, "discover.neighbors") ||
+             (!strcmp(c, "discover") && argc >= 2 && !strcmp(argv[1], "neighbors"))) {
+        cli_discover_neighbors();
+        out("OK - Discover sent");
         done = true;
     }
     else if (!strcmp(c, "acl")) { cmd_acl(); done = true; }
-    else if (!strcmp(c, "stats-core"))                      { FINISH(cmd_stats_core()); }
-    else if (!strcmp(c, "stats-packets"))                   { FINISH(cmd_stats_packets()); }
+    else if (!strcmp(c, "stats-core"))                      { FINISH(cmd_stats(format_stats_core)); }
+    else if (!strcmp(c, "stats-radio"))                     { FINISH(cmd_stats(format_stats_radio)); }
+    else if (!strcmp(c, "stats-packets"))                   { FINISH(cmd_stats(format_stats_packets)); }
     else if (!strcmp(c, "time"))                            { cmd_time(argc, argv); done = true; }
     else if (!strcmp(c, "advert"))                          { cmd_advert(argc, argv); done = true; }
     else if (!strcmp(c, "password"))                        { cmd_password(argc, argv); done = true; }

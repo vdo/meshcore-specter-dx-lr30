@@ -27,6 +27,7 @@ AclEntry* acl_add(const uint8_t* pub) {
     memset(victim, 0, sizeof(*victim));
     memcpy(victim->pub, pub, ACL_PUBKEY);
     victim->active = 1;
+    victim->out_path_len = ACL_OUT_PATH_UNKNOWN;
     return victim;
 }
 

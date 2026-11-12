@@ -14,6 +14,7 @@
 #define ACL_MAX     4
 #define ACL_PUBKEY  32
 #define ACL_SECRET  32
+#define ACL_OUT_PATH_UNKNOWN 0xFF   // official OUT_PATH_UNKNOWN
 
 // permission levels (lower bits, matching MeshCore PERM_ACL_*)
 #define PERM_GUEST     0
@@ -28,6 +29,8 @@ typedef struct {
     uint8_t  active;
     uint32_t last_activity_ms;     // our clock (idle timeout)
     uint32_t last_ts;              // their clock (login replay guard)
+    uint8_t  out_path_len;         // path header byte for DIRECT replies, or ACL_OUT_PATH_UNKNOWN
+    uint8_t  out_path[64];         // learned from the client's PATH packet
 } AclEntry;
 
 AclEntry*      acl_by_pub(const uint8_t* pub);       // active entry by full pubkey

@@ -320,10 +320,20 @@ needed beyond `platform = ststm32` with `framework = arduino`.
 
 ## LED Behaviour Patterns
 
-The onboard LED is on **PB11, active HIGH** (HIGH = ON, LOW = OFF).
+The onboard LED is on **PB11, active HIGH** (HIGH = ON, LOW = OFF). All patterns
+after boot are **non-blocking** (`led_pulse()`, switched off from `loop()`), so the
+radio keeps receiving and the CPU keeps sleeping while the LED is lit.
 
 | Pattern | Trigger |
 |---------|---------|
+| 5 quick blinks (boot) | App firmware started (before radio init) |
+| OFF (idle) | Radio initialised, listening for packets |
+| 50 ms pulse every 10 s | Heartbeat (sign of life) |
+| 20 ms pulse | LoRa packet received (any route type) |
+| Solid ON for the airtime | Transmitting (any packet: relay, advert, reply) |
+| Triple blink every 3 s | Radio init failed — degraded mode, CLI still alive |
+
+---------|---------|
 | Solid ON (boot) | `setup()` running — identity init + radio init in progress |
 | OFF (idle) | Radio initialised, listening for packets |
 | 1 × 80 ms blink | Heartbeat every 10 s (sign of life) |
@@ -502,12 +512,13 @@ EU 868 MHz duty-cycle compliance is a **token bucket**, matching the official
   capped at the max. So idle time tops the bucket back up.
 - **Consume:** each TX subtracts its *measured* on-air time (from a `millis()`
   around `radio.transmit()`), clamped at 0.
-- **Gate:** before a TX, if the budget is below the estimated airtime, wait for
-  the deficit to refill (`wait = deficit × 100 / dutycycle`, in ≤500 ms slices).
-  Capped at `DUTY_SILENCE_MAX_MS` (30 s) as a safety.
+- **Gate (official Dispatcher):** a queued packet is sent only once the budget
+  holds at least half a max-size (255 B) packet's airtime; after a TX that leaves
+  less than 100 ms, the next TX waits for the deficit to refill. Packets wait in
+  the send queue meanwhile — the radio keeps receiving, nothing blocks.
 - **Boot:** the bucket starts **full**, so a freshly booted node can burst before
   it's throttled — same as the official.
-- **Visibility:** `stats-core` reports `budget=<ms>` (the remaining budget).
+- **Visibility:** `stats-core` reports `queue_len` (packets waiting).
 
 All math is integer fixed-point with 64-bit intermediates (no float), so it's
 newlib-nano safe. `dutycycle` 0 or ≥100 disables enforcement.

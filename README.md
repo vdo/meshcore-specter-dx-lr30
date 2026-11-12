@@ -152,7 +152,7 @@ set radio 869.525,62.5,8,5   → OK, reboot to apply
 get flood.advert.interval    → 17            (hours, 3-168, EU default 47)
 set advert.interval 120      → OK            (zero-hop minutes, 60-240, 0=off)
 neighbors                    → F7A9:1793148995:45
-stats-packets                → rx=7 relay=4 drop=3 advert=1
+stats-packets                → {"recv":7,"sent":4,"flood_tx":3,"direct_tx":1,...}  (official JSON; also stats-core, stats-radio)
 log / log erase              → last 20 diagnostic lines / empty buffer
 clock / time 1793052700      → re-sync advert clock
 advert / advert.zerohop      → trigger an ADVERT now
@@ -182,7 +182,7 @@ WARNING: Radio-module inserted wrong way here!
 | Radio | SX1262 | Sub-GHz LoRa, up to +22 dBm |
 | USB-Serial | CH340 (CH340C) | DTR/RTS entry not wired -> No software DFU |
 | SWD header | V G D C = 3V3/GND/SWDIO (PA13)/SWCLK (PA14) | Headless flashing with an ST-Link V2 |
-| LED | PB11 | Active HIGH — 1 blink = RX · 2 fast blinks = relay · solid = ADVERT TX |
+| LED | PB11 | Active HIGH — short pulse = RX · solid = transmitting · 10 s heartbeat |
 
 BOOT0 pin is disconnected. It captures random voltages, therefore it's sometimes possible
 to enter the bootloader mode just by pressing the RST
