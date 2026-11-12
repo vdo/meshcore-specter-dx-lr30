@@ -136,6 +136,9 @@ uint32_t stat_advert = 0;   // adverts transmitted
 #define PAYLOAD_TYPE_TRACE     0x09
 #define MAX_HOPS               64
 #define MAX_PKT                256
+#define MAX_PAYLOAD            184   // official MAX_PACKET_PAYLOAD: larger payloads are dropped
+#define MAX_PATH_SIZE          64    // official: hop_count * hash_size <= 64 bytes
+#define ADV_TYPE_REPEATER      2     // advert appdata flags & 0x0F
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
 #define FIRST_ADVERT_MS        5000UL                   // 5 s after boot
@@ -220,13 +223,16 @@ static void identity_init(void) {
 static uint8_t  dedup_buf[DEDUP_SIZE][DEDUP_FP];
 static uint8_t  dedup_head = 0;
 
-static bool dedup_seen(const uint8_t* payload, uint8_t ptype, uint8_t plen) {
-    // Compute SHA256(ptype || payload), keep first DEDUP_FP bytes
+// path_len >= 0 is hashed in too (TRACE only, as the official calculatePacketHash
+// does: a trace can revisit the same node on its return path).
+static bool dedup_seen(const uint8_t* payload, uint8_t ptype, uint8_t plen, int path_len = -1) {
+    // Compute SHA256(ptype [|| path_len] || payload), keep first DEDUP_FP bytes
     uint8_t fp[DEDUP_FP];
     {
         SHA256 sha;
         sha.reset();
         sha.update(&ptype, 1);
+        if (path_len >= 0) { uint8_t pl = (uint8_t)path_len; sha.update(&pl, 1); }
         sha.update(payload, plen);
         uint8_t full[32];
         sha.finalize(full, 32);
@@ -270,10 +276,8 @@ static void hex_dump(const uint8_t* buf, int len, int max) {
 }
 #endif
 
-// ─── RF switch helpers ───────────────────────────────────────────────────────
-static void rf_rx(void)   { digitalWrite(PIN_TXEN, LOW);  digitalWrite(PIN_RXEN, HIGH); }
-static void rf_tx(void)   { digitalWrite(PIN_TXEN, HIGH); digitalWrite(PIN_RXEN, LOW);  }
-static void rf_idle(void) { digitalWrite(PIN_TXEN, LOW);  digitalWrite(PIN_RXEN, LOW); }
+// RF switch (TXEN/RXEN) is driven by RadioLib via setRfSwitchPins() in
+// radio_init() — standby/RX/TX states follow the radio automatically.
 
 // LED patterns (active HIGH on PB11)
 //   1 blink        = packet received
@@ -288,38 +292,47 @@ static void led_blink(uint8_t n, uint16_t ms) {
     }
 }
 
-// ─── Compile-time Unix timestamp ────────────────────────────────────────────
-// Converts __DATE__ "Mmm DD YYYY" + __TIME__ "HH:MM:SS" → Unix epoch seconds.
-// Used as timestamp base so ADVERTs carry valid Unix time (companions may
-// reject packets where |now - ts| > 3600 s as replay-protection).
-// Re-sync at runtime with the CLI `time <epoch>` command.
-static uint32_t build_unix_ts(void) {
-    const char* d = __DATE__;   // "May 31 2026"
-    const char* t = __TIME__;   // "14:32:33"
-    // Month
-    static const char* mn = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    int month = 1;
-    for (int m = 0; m < 12; m++) {
-        if (d[0]==mn[m*3] && d[1]==mn[m*3+1] && d[2]==mn[m*3+2]) { month=m+1; break; }
-    }
-    int day  = (d[4]==' ' ? 0 : d[4]-'0')*10 + (d[5]-'0');
-    int year = (d[7]-'0')*1000+(d[8]-'0')*100+(d[9]-'0')*10+(d[10]-'0');
-    int hour = (t[0]-'0')*10+(t[1]-'0');
-    int min  = (t[3]-'0')*10+(t[4]-'0');
-    int sec  = (t[6]-'0')*10+(t[7]-'0');
-    // Days from 1970 to Jan 1 of build year
-    int y = year - 1970;
-    uint32_t days = (uint32_t)y * 365UL + (uint32_t)((y + 1) / 4);
-    // Days in each month up to build month
-    const int md[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    for (int m = 1; m < month; m++) {
-        days += md[m-1];
-        if (m == 2 && (year % 4 == 0)) days++;
-    }
-    days += (uint32_t)(day - 1);
-    return days * 86400UL + (uint32_t)hour*3600UL + (uint32_t)min*60UL + (uint32_t)sec;
+// ─── Build-time Unix timestamp (clock base at boot) ─────────────────────────
+// BUILD_EPOCH comes from platformio.ini (-D BUILD_EPOCH=$UNIX_TIME): real UTC.
+// (The old __DATE__/__TIME__ parse used the compiler's LOCAL time as if it were
+// UTC, so the clock started ahead by the build machine's UTC offset — and since
+// the clock never goes backwards, `time` couldn't correct it.)
+// Re-sync at runtime with `time <epoch>` (USB) or `clock sync` (mesh admin).
+#ifndef BUILD_EPOCH
+#error "BUILD_EPOCH not set: add -D BUILD_EPOCH=$UNIX_TIME to build_flags"
+#endif
+static uint32_t build_unix_ts(void) { return (uint32_t)BUILD_EPOCH; }
+static uint32_t ts_base = 0;   // epoch at uptime 0; set in setup(), moved by time/clock sync
+
+// Uptime in seconds that does NOT wrap at 49.7 days like millis() does (64-bit
+// ms accumulator, as the official VolatileRTCClock). Must be called at least once
+// per 49 days — loop() calls it every pass.
+static uint64_t uptime_ms_acc = 0;
+static uint32_t uptime_prev_ms = 0;
+uint32_t uptime_secs(void) {
+    uint32_t n = millis();
+    uptime_ms_acc += (uint32_t)(n - uptime_prev_ms);
+    uptime_prev_ms = n;
+    return (uint32_t)(uptime_ms_acc / 1000ULL);
 }
-static uint32_t ts_base = 0;   // set in setup(); millis() added at runtime
+static uint32_t now_epoch(void) { return ts_base + uptime_secs(); }
+
+// Clock backup across resets: the STM32 backup registers (BKP DR1..DR3) survive
+// software / watchdog / pin resets while VDD stays up (cleared on power loss) —
+// the same idea as the official ESP32 RTC-memory backup. Without it every reboot
+// rewinds the clock to build time and peers drop our adverts as replays.
+#define BKP_CLOCK_MAGIC 0x5A17
+static void bkp_save_time(uint32_t t) {
+    BKP->DR2 = t & 0xFFFF;
+    BKP->DR3 = t >> 16;
+    BKP->DR1 = BKP_CLOCK_MAGIC;   // magic last: a torn write is never trusted
+}
+static uint32_t bkp_restore_time(void) {
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    PWR->CR |= PWR_CR_DBP;        // enable backup-domain writes
+    if ((BKP->DR1 & 0xFFFF) != BKP_CLOCK_MAGIC) return 0;
+    return ((BKP->DR3 & 0xFFFF) << 16) | (BKP->DR2 & 0xFFFF);
+}
 
 // ─── RadioLib object ─────────────────────────────────────────────────────────
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI);
@@ -358,6 +371,9 @@ static bool radio_init(void) {
         return false;
     }
     radio.setRfSwitchPins(PIN_RXEN, PIN_TXEN);
+    // RadioLib's begin() caps PA current at 60 mA and setOutputPower keeps it,
+    // which clips output above ~17 dBm. MeshCore uses 140 mA (SX126X_CURRENT_LIMIT).
+    radio.setCurrentLimit(140.0);
     radio.setCRC(2);   // CRC-16 on
     radio.setDio1Action(on_dio1);   // DIO1 (PC15) fires on RxDone → sets rx_flag
     // RX gain (reg 0x08AC): 0x96 boosted / 0x94 power-saving. The driver leaves
@@ -381,10 +397,11 @@ static bool radio_init(void) {
 //     Unsigned or incorrectly signed packets are silently discarded.
 //     This was the root cause of "0 repeaters" during early development.
 //     See docs/development-notes.md#ed25519-signature-requirement for details.
-static int build_advert(uint8_t* buf) {
+// zero_hop: ROUTE_DIRECT with an empty path, so neighbours hear it but nobody
+// relays it (official sendZeroHop). Otherwise ROUTE_FLOOD (mesh-wide).
+static int build_advert(uint8_t* buf, bool zero_hop) {
     int i = 0;
-    // Header: ROUTE_FLOOD | (PAYLOAD_ADVERT << 2) = 0x11
-    buf[i++] = (uint8_t)(ROUTE_FLOOD | (PAYLOAD_ADVERT << 2));
+    buf[i++] = (uint8_t)((zero_hop ? ROUTE_DIRECT : ROUTE_FLOOD) | (PAYLOAD_ADVERT << 2));
     // Path header: [hash_size_code(2) | hop_count(6)]. 0 hops; hash size from
     // path.hash.mode (packed in loop_detect bits [3:2]; 0=1B, 1=2B, 2=3B).
     uint8_t phm = (cfg.loop_detect >> 2) & 0x03;
@@ -395,7 +412,8 @@ static int build_advert(uint8_t* buf) {
     memcpy(buf + i, own_pubkey, 32); i += 32;
 
     // timestamp (4 bytes LE): compile-time Unix base + uptime seconds
-    uint32_t ts = ts_base + millis() / 1000UL;
+    uint32_t ts = now_epoch();
+    bkp_save_time(ts);   // a reset must never rewind below an advertised timestamp
     memcpy(buf + i, &ts, 4); i += 4;
 
     // signature placeholder (filled in after appdata is known)
@@ -429,6 +447,9 @@ static int build_advert(uint8_t* buf) {
     memcpy(msg + mlen, buf + appdata_offset, appdata_len); mlen += appdata_len;
     Ed25519::sign(buf + sig_offset, own_privkey, own_pubkey, msg, mlen);
 
+    // Mark our own advert seen (official markSeen on send): a flood copy relayed
+    // back to us is then dropped instead of re-relayed.
+    dedup_seen(buf + 2, PAYLOAD_ADVERT, (uint8_t)(i - 2));
     return i;
 }
 
@@ -439,10 +460,10 @@ static int build_advert(uint8_t* buf) {
 // "basic" line) and no RTC (millis() is uptime, identical across nodes at the
 // same uptime), so seed an LCG from the unique 96-bit STM32 UID — each chip gets
 // a different sequence, so simultaneous retransmissions diverge.
-// relay_is_flood: set by process_pkt for flood relays (need the backoff);
-// false for direct relays / PING responses / original packets (no backoff).
-static uint32_t rng_state    = 1;
-static bool     relay_is_flood = false;
+// relay_delay_x10: set by process_pkt — the txdelay factor (x10) for a flood
+// relay, direct.txdelay for a direct/trace relay. Original packets use 0.
+static uint32_t rng_state       = 1;
+static uint8_t  relay_delay_x10 = 0;
 static void rng_seed_uid(void) {
     const uint32_t uid[3] = {
         *(volatile uint32_t*)0x1FFFF7E8U,
@@ -501,23 +522,33 @@ uint32_t get_tx_budget_ms(void) {
 static void slog(const char* fmt, ...);   // fwd: important → log ring + USB
 static void dlog(const char* fmt, ...);   // fwd: verbose → USB only
 
-// ─── Send a packet (with RF switch + token-bucket duty-cycle gating) ─────────
-static bool send_pkt(const uint8_t* buf, int len, bool flood_relay) {
-    rf_idle();
+// Offset of the path-header byte: route types TRANSPORT_FLOOD / TRANSPORT_DIRECT
+// carry 4 bytes of transport codes between the header and the path (official
+// Packet::hasTransportCodes / readFrom).
+static int path_hdr_offset(uint8_t header) {
+    uint8_t r = header & 0x03;
+    return (r == ROUTE_TRANSPORT_FLOOD || r == ROUTE_TRANSPORT_DIRECT) ? 5 : 1;
+}
 
+// ─── Send a packet (retransmit delay + token-bucket duty-cycle gating) ───────
+// delay_x10: retransmit delay factor x10 (0 = send now). Random delay in
+// [0, 5 * airtime * factor], as the official getRetransmitDelay /
+// getDirectRetransmitDelay.
+static bool send_pkt(const uint8_t* buf, int len, uint8_t delay_x10) {
     // TX log (RX/TX correlation): ptype, first 2 payload bytes (dest/src for
     // admin, pubkey for advert), hop count, fingerprint. If an RX fp later
     // matches this fp, this packet is coming back to us.
-    if (len >= 3) {
+    int ph = path_hdr_offset(buf[0]);
+    if (len >= ph + 2) {
         uint8_t ptype    = (buf[0] >> 2) & 0x0F;
-        uint8_t path_hdr = buf[1];
+        uint8_t path_hdr = buf[ph];
         uint8_t hc  = path_hdr & 0x3F;
         uint8_t hs  = ((path_hdr >> 6) & 0x03) + 1;
         int  pb  = hc * hs;
-        if (len >= 2 + pb + 2) {
-            const uint8_t* pl = buf + 2 + pb;
+        if (len >= ph + 1 + pb + 2) {
+            const uint8_t* pl = buf + ph + 1 + pb;
             char fp[9];
-            short_fp(pl, ptype, (uint8_t)(len - 2 - pb), fp);
+            short_fp(pl, ptype, (uint8_t)(len - ph - 1 - pb), fp);
             dlog("TX p=%d d=%02X s=%02X hc=%d fp=%s", ptype, pl[0], pl[1], (int)hc, fp);
         }
     }
@@ -529,28 +560,27 @@ static bool send_pkt(const uint8_t* buf, int len, bool flood_relay) {
     uint32_t est_airtime_ms = (uint32_t)(radio.getTimeOnAir(len) / 1000);
     if (est_airtime_ms == 0) est_airtime_ms = radio_airtime_ms;
 
-    // Retransmit delay: only for FLOOD relays (collision avoidance — spread out
-    // simultaneous retransmissions of the same packet by different repeaters).
-    // Original packets (adverts, admin replies) and DIRECT retransmissions /
-    // PING responses are not delayed (matches the official: getRetransmitDelay
-    // for flood, getDirectRetransmitDelay = 0). Random 0..~2×airtime, per-chip.
-    if (flood_relay) {
-        uint32_t t       = (est_airtime_ms * 52u / 50u) / 2u;   // ≈ airtime/2
-        uint32_t backoff = rng_range(5) * t;                    // 0..4t ≈ 0..2×airtime
+    // Retransmit delay (collision avoidance — spreads out retransmissions of
+    // the same packet by different repeaters). Relays only; per-chip RNG.
+    if (delay_x10) {
+        uint32_t t       = est_airtime_ms * delay_x10 / 10u;
+        uint32_t backoff = rng_range(5u * t + 1u);
         if (backoff > 0) delay(backoff);
-    } else {
-        delay(1);   // brief RF-switch settle
     }
 
     // Token bucket: ensure the budget covers this TX before transmitting
     updateTxBudget();
     duty_wait(est_airtime_ms);
 
-    rf_tx();
     uint32_t tx0   = millis();
     int      state = radio.transmit(const_cast<uint8_t*>(buf), len);
     uint32_t airtime = millis() - tx0;   // actual on-air time
-    rf_idle();
+    // DIO1 also rises on TxDone, so on_dio1() just set rx_flag. Left set, the
+    // next loop would readData() a non-existent packet — RadioLib returns the
+    // buffer, i.e. our own TX bytes cut to the last RX length (the old
+    // "bit-flipped self-pickup"). The official wrapper tracks a TX-wait state
+    // for the same reason.
+    rx_flag = false;
 
     // Accumulate TX stats (air time + flood/direct counts)
     stat_tx_air_ms += airtime;
@@ -620,7 +650,7 @@ static void send_admin_reply(uint8_t ptype, const uint8_t* client_hash, const ui
     // so a peer drops any packet > 184 B. packet = 6 + round16(data_len) ≤ 184
     // → data_len ≤ 176 (packet 182 B). Staying under this is required for
     // one-packet interop with the official companion.
-    if (data_len > 150) data_len = 176;
+    if (data_len > 176) data_len = 176;
     static uint8_t b[MAX_PKT];   // static: 1 KB stack is too small for this + handlers
     int n = 0;
     b[n++] = (uint8_t)(ROUTE_FLOOD | (ptype << 2));
@@ -635,10 +665,37 @@ static void send_admin_reply(uint8_t ptype, const uint8_t* client_hash, const ui
     // → same fingerprint, so it's deduped here instead of re-relayed, which is
     // what was producing duplicate replies.
     dedup_seen(b + 2, ptype, (uint8_t)(n - 2));
-    send_pkt(b, n, false);          // original packet — no retransmit delay
+    send_pkt(b, n, 0);              // original packet — no retransmit delay
+}
+
+// Decrypted-plaintext buffer shared by the admin handlers (never concurrent).
+// One byte past MAX_PAYLOAD so the plaintext can always be NUL-terminated.
+static uint8_t dec_buf[MAX_PAYLOAD + 1];
+
+// Verify MAC + decrypt into dec_buf (bounded), NUL-terminate. Returns the
+// plaintext length, or 0 on MAC failure / malformed / oversized input.
+static int admin_decrypt(const uint8_t* secret, const uint8_t* mac_data, int enc_len) {
+    int len = mesh_mac_then_decrypt(secret, dec_buf, MAX_PAYLOAD, mac_data, enc_len);
+    dec_buf[len] = 0;
+    return len;
+}
+
+// Find the session whose secret decrypts this REQ/TXT_MSG. src is only a 1-byte
+// hash, so try every active session with that first byte (the official tries
+// all matching peers). Returns the session (plaintext in dec_buf) or NULL.
+static AclEntry* session_decrypt(uint8_t src_hash, const uint8_t* mac_data, int enc_len, int* out_len) {
+    for (int i = 0; i < ACL_MAX; i++) {
+        AclEntry* e = (AclEntry*)acl_at(i);
+        if (!e || !e->active || e->pub[0] != src_hash) continue;
+        int len = admin_decrypt(e->secret, mac_data, enc_len);
+        if (len > 0) { *out_len = len; return e; }
+    }
+    return 0;
 }
 
 // Login (ANON_REQ): payload = [dest_hash][sender_pub(32)][MAC+AES(ts(4)+password)]
+// Returns true once the MAC verifies (the packet was for us, even if the login
+// is then refused); false means "not ours" and the caller relays it.
 static bool handle_anon_req(const uint8_t* pl, int plen) {
     if (plen < 1 + 32 + 2 + 1) return false;
     const uint8_t* sender_pub = pl + 1;
@@ -648,9 +705,10 @@ static bool handle_anon_req(const uint8_t* pl, int plen) {
     uint8_t secret[32];
     ed25519_key_exchange(secret, sender_pub, own_x25519_key);
 
-    static uint8_t data[160];   // static: keep the 1 KB stack small
-    int len = mesh_mac_then_decrypt(secret, data, macData, enc_len);
-    if (len < 5) return false;
+    int len = admin_decrypt(secret, macData, enc_len);
+    if (len == 0) return false;
+    if (len < 5) return true;
+    uint8_t* data = dec_buf;
     uint32_t their_ts; memcpy(&their_ts, data, 4);
     const char* password = (const char*)(data + 4);
 
@@ -663,26 +721,26 @@ static bool handle_anon_req(const uint8_t* pl, int plen) {
             perms = PERM_READ;             // guest pw unset → blank pw gets guest (read-only),
                                            // so the app's guest/Repeater-Status path works out of the box
         } else {
-            return false;                  // blank pw, no existing session, guest pw set → reject
+            return true;                   // blank pw, no existing session, guest pw set → reject
         }
     } else if (adm.admin_password[0] && strcmp(password, (const char*)adm.admin_password) == 0) {
         perms = PERM_ADMIN;
     } else if (adm.guest_password[0] && strcmp(password, (const char*)adm.guest_password) == 0) {
         perms = PERM_READ;                  // guest = read-only (no set, no reboot/erase)
     } else {
-        return false;                      // bad password
+        return true;                       // bad password
     }
 
-    AclEntry* e = acl_add(sender_pub, perms, secret);
-    if (!e) return false;                  // ACL full
-    if (their_ts <= e->last_ts) return false;   // login replay guard
+    AclEntry* e = acl_add(sender_pub);     // evicts the least-active non-admin if full
+    if (their_ts <= e->last_ts) return true;    // login replay guard (before touching the entry)
     e->perms = perms;
+    memcpy(e->secret, secret, sizeof(e->secret));
     e->last_ts = their_ts;
     e->last_activity_ms = millis();
 
     // login RESPONSE: [ts(4)][RESP_SERVER_LOGIN_OK=0][0][is_admin][perms][rand(4)][ver_level]
     static uint8_t resp[13];
-    uint32_t now = ts_base + millis() / 1000;
+    uint32_t now = now_epoch();
     memcpy(resp, &now, 4);
     resp[4]  = RESP_SERVER_LOGIN_OK;
     resp[5]  = 0;
@@ -702,6 +760,9 @@ static bool handle_anon_req(const uint8_t* pl, int plen) {
 // Minimum permission a CLI command requires (ACL gate). Fail-safe: unknown → ADMIN.
 static uint8_t cmd_perm_needed(const char* text) {
     while (*text == ' ' || *text == '\t') text++;
+    // Secrets: anything mentioning a password (get/set admin.password,
+    // guest.password, "password") is admin-only — whatever the spacing.
+    if (strstr(text, "password"))       return PERM_ADMIN;
     // Calibration writes: admin or local-serial only (stricter than the generic
     // "set"→READWRITE and "battery"→READ rules further down).
     if (!strncmp(text, "battery.charged", 15)) return PERM_ADMIN;
@@ -711,12 +772,12 @@ static uint8_t cmd_perm_needed(const char* text) {
     if (!strncmp(text, "ver", 3))       return PERM_READ;
     if (!strncmp(text, "board", 5))     return PERM_READ;
     if (!strncmp(text, "role", 4))      return PERM_READ;
-    if (!strncmp(text, "clock", 5))     return PERM_READ;
-    if (!strncmp(text, "time", 4))      return PERM_READ;
+    // Bare "clock" / "log" read; any argument ("clock sync", "log clear") writes.
+    if (!strncmp(text, "clock", 5))     return text[5] ? PERM_ADMIN : PERM_READ;
     if (!strncmp(text, "stats", 5))     return PERM_READ;
     if (!strncmp(text, "battery", 7))   return PERM_READ;
     if (!strncmp(text, "neighbors", 9)) return PERM_READ;
-    if (!strncmp(text, "log", 3))       return PERM_READ;
+    if (!strncmp(text, "log", 3))       return text[3] ? PERM_ADMIN : PERM_READ;
     if (!strncmp(text, "acl", 3))       return PERM_READ;
     if (!strncmp(text, "set", 3))       return PERM_READWRITE;
     // reboot / erase / dfu and anything unrecognized require full admin
@@ -849,18 +910,19 @@ int16_t measure_mcu_temp(void) {
 // Decrypt with the session secret, dispatch by request type, and reply with a
 // RESPONSE (p=1) = [their_ts(4)][response_data]. Implements REQ_TYPE_GET_STATUS
 // (0x01, guest-accessible) → RepeaterStats; other types are logged + dumped.
+// Returns true if a session decrypted it (ours), false → caller relays it.
 static bool handle_req(const uint8_t* pl, int plen) {
     if (plen < 2 + 2 + 5) { slog("REQ short"); return false; }
     uint8_t src_hash = pl[1];
-    AclEntry* e = acl_by_hash(src_hash);
-    if (!e) { slog("REQ no sess"); return false; }
-
-    static uint8_t data[160];   // static: keep the 1 KB stack small
-    memset(data, 0, sizeof(data));
-    int len = mesh_mac_then_decrypt(e->secret, data, pl + 2, plen - 2);
-    if (len < 5) { slog("REQ MAC fail"); return false; }
+    int len = 0;
+    AclEntry* e = session_decrypt(src_hash, pl + 2, plen - 2, &len);
+    if (!e) { slog("REQ no sess/MAC"); return false; }
+    if (len < 5) return true;
+    uint8_t* data = dec_buf;
 
     uint32_t their_ts; memcpy(&their_ts, data, 4);   // request timestamp
+    // Replay guard (official: timestamp must be strictly newer for a REQ)
+    if (their_ts <= e->last_ts) { slog("REQ replay"); return true; }
     uint8_t req_type = data[4];
     dlog("REQ src=%02X type=0x%02X", src_hash, req_type);
 
@@ -877,7 +939,7 @@ static bool handle_req(const uint8_t* pl, int plen) {
         s.n_packets_recv         = stat_rx;
         s.n_packets_sent         = stat_sent_flood + stat_sent_direct;
         s.total_air_time_secs    = stat_tx_air_ms / 1000;
-        s.total_up_time_secs     = millis() / 1000;
+        s.total_up_time_secs     = uptime_secs();
         s.n_sent_flood           = stat_sent_flood;
         s.n_sent_direct          = stat_sent_direct;
         s.n_recv_flood           = stat_recv_flood;
@@ -891,7 +953,7 @@ static bool handle_req(const uint8_t* pl, int plen) {
         memcpy(resp + 4, &s, sizeof(s));
         send_admin_reply(PAYLOAD_TYPE_RESPONSE, &e->pub[0], e->secret, resp, 4 + sizeof(s));
         e->last_activity_ms = millis();
-        if (their_ts > e->last_ts) e->last_ts = their_ts;
+        e->last_ts = their_ts;
         return true;
     }
     if (req_type == REQ_GET_TELEMETRY) {
@@ -920,7 +982,7 @@ static bool handle_req(const uint8_t* pl, int plen) {
         memcpy(resp + 4, lpp, p);
         send_admin_reply(PAYLOAD_TYPE_RESPONSE, &e->pub[0], e->secret, resp, 4 + p);
         e->last_activity_ms = millis();
-        if (their_ts > e->last_ts) e->last_ts = their_ts;
+        e->last_ts = their_ts;
         return true;
     }
     // Unknown request type: log + dump the request fields, no reply.
@@ -932,22 +994,22 @@ static bool handle_req(const uint8_t* pl, int plen) {
 }
 
 // TXT_MSG: payload = [dest_hash][src_hash][MAC+AES(ts(4)+flags(1)+text)]
+// Returns true if a session decrypted it (ours), false → caller relays it.
 static bool handle_txt_msg(const uint8_t* pl, int plen) {
     if (plen < 2 + 2 + 5) { slog("TXM short"); return false; }
     uint8_t src_hash = pl[1];
-    AclEntry* e = acl_by_hash(src_hash);
-    if (!e) { slog("TXM no sess"); return false; }   // unknown session
-
-    static uint8_t data[160];   // static: keep the 1 KB stack small
-    memset(data, 0, sizeof(data));
     // The sender sizes the datagram to exactly 5+text_len and omits the null
-    // terminator; when 5+text_len is a 16-multiple there is no zero padding, so
-    // the plaintext is NOT null-terminated. Pre-clearing the buffer guarantees
-    // the byte right after the text is a real 0, so strnlen/strchr stop there
-    // instead of reading stale bytes from a previous message.
-    int len = mesh_mac_then_decrypt(e->secret, data, pl + 2, plen - 2);
-    if (len < 5) { slog("TXM MAC fail"); return false; }
+    // terminator; when 5+text_len is a 16-multiple there is no zero padding.
+    // admin_decrypt() NUL-terminates right after the plaintext.
+    int len = 0;
+    AclEntry* e = session_decrypt(src_hash, pl + 2, plen - 2, &len);
+    if (!e) { slog("TXM no sess/MAC"); return false; }
+    if (len < 5) return true;
+    uint8_t* data = dec_buf;
     uint32_t their_ts; memcpy(&their_ts, data, 4);
+    // Replay guard (official): older → drop; equal → a retry of the last command,
+    // don't run it again (a replayed 'erase' must not re-execute).
+    if (their_ts <= e->last_ts) { slog("TXM replay/retry"); return true; }
     uint8_t flags = data[4] >> 2;
     const char* text = (const char*)(data + 5);
 
@@ -989,18 +1051,20 @@ static bool handle_txt_msg(const uint8_t* pl, int plen) {
     // both mean "run this". Genuine command *replies* are addressed to the client,
     // never to us, so accepting both can't mis-fire here.
     if (flags != TXT_TYPE_CLI_COMMAND && flags != TXT_TYPE_CLI_DATA) {
-        slog("TXM not cmd"); return false;
+        slog("TXM not cmd"); return true;
     }
-    if (e->perms < cmd_perm_needed(cmd)) { slog("TXM deny"); return false; }
+    e->last_ts = their_ts;   // consumed (even if denied) so it can't be replayed
+    if (e->perms < cmd_perm_needed(cmd)) { slog("TXM deny"); return true; }
 
     static char reply[176];
-    int rlen = cli_execute(cmd, reply, sizeof(reply));
+    int rlen = cli_execute(cmd, reply, sizeof(reply), their_ts);
     int prefix_len = sess_len ? (sess_len + 1) : 0;   // "<sess>|"
     if (rlen > 171 - prefix_len) rlen = 171 - prefix_len;   // keep ts(4)+flags(1)+text ≤ 176
 
     // reply as TXT_MSG CLI_DATA: [ts(4)][flags=CLI_DATA<<2][<sess>|]<reply>
     static uint8_t out[180];
-    uint32_t now = ts_base + millis() / 1000;
+    uint32_t now = now_epoch();
+    if (now == their_ts) now++;   // official workaround: reply ts must differ from the request's
     memcpy(out, &now, 4);
     out[4] = (uint8_t)(TXT_TYPE_CLI_DATA << 2);
     int o = 5;
@@ -1010,7 +1074,6 @@ static bool handle_txt_msg(const uint8_t* pl, int plen) {
     send_admin_reply(PAYLOAD_TYPE_TXT_MSG, &e->pub[0], e->secret, out, o + rlen);
 
     e->last_activity_ms = millis();
-    if (their_ts > e->last_ts) e->last_ts = their_ts;
     return true;
 }
 
@@ -1030,27 +1093,32 @@ static bool path_contains_own(const uint8_t* path, int hops, uint8_t hash_size) 
 }
 
 static bool process_pkt(const uint8_t* data, int len) {
-    relay_is_flood = false;   // reset; set true only on the flood-relay return
-    if (len < 3) { dlog("Drop: malformed"); return false; }
+    relay_delay_x10 = 0;   // set on every relay return
+    if (len < 1) { dlog("Drop: malformed"); return false; }
 
+    // Layout: header [transport codes(4), route types 0/3 only] path_hdr path payload
     uint8_t header = data[0];
     uint8_t route  = header & 0x03;
+    bool    direct = (route == ROUTE_DIRECT || route == ROUTE_TRANSPORT_DIRECT);
+    uint8_t ptype  = (header >> 2) & 0x0F;
+    int     ph     = path_hdr_offset(header);
+    if (len < ph + 2) { dlog("Drop: malformed"); return false; }
 
-    int idx = 1;
-
-    // Path header byte: [hop_count(6) | hash_size_code(2)]
-    uint8_t path_hdr  = data[idx++];
+    // Path header byte: [hash_size_code(2) | hop_count(6)]
+    uint8_t path_hdr  = data[ph];
     uint8_t hop_count = path_hdr & 0x3F;
     uint8_t hs_code   = (path_hdr >> 6) & 0x03;
-    uint8_t hash_size = hs_code + 1;   // 1–4 bytes per hop
-    uint8_t ptype     = (header >> 2) & 0x0F;
-
-    int path_bytes = hop_count * hash_size;
-    if (idx + path_bytes > len) { dlog("Drop: malformed"); return false; }
+    uint8_t hash_size = hs_code + 1;
+    int     path_bytes = hop_count * hash_size;
+    // Official Packet::isValidPathLen: code 3 (4-byte hashes) is reserved, path <= 64 B
+    if (hs_code == 3 || path_bytes > MAX_PATH_SIZE) { dlog("Drop: bad path"); return false; }
+    int idx = ph + 1;
+    if (idx + path_bytes >= len) { dlog("Drop: malformed"); return false; }   // need >= 1 payload byte
 
     const uint8_t* path_ptr    = data + idx;
     const uint8_t* payload_ptr = data + idx + path_bytes;
     int            payload_len = len - idx - path_bytes;
+    if (payload_len > MAX_PAYLOAD) { dlog("Drop: too large"); return false; }   // official drops these
 
     // RX log (RX/TX correlation): ptype, first 2 payload bytes (dest/src for
     // admin, pubkey for advert), hop count, fingerprint. If this fp matches a
@@ -1061,77 +1129,88 @@ static bool process_pkt(const uint8_t* data, int len) {
         dlog("RX p=%d d=%02X s=%02X hc=%d fp=%s", ptype, payload_ptr[0], payload_ptr[1], (int)hop_count, fp);
     }
 
-    // ── Neighbor cache: record every ADVERT we hear ──────────────────────────
-    if (ptype == PAYLOAD_ADVERT && payload_len >= 40) {
-        // Skip SELF adverts (our own pubkey) — matches official's self_id.matches().
-        // Store the time we HEARD it (our clock) so the reply can show secs-ago.
-        if (memcmp(payload_ptr, own_pubkey, 32) != 0) {
-            uint32_t heard_s = millis() / 1000UL;
-            int8_t snr_x4 = (int8_t)(radio.getSNR() * 4.0f);
-            neighbor_add(payload_ptr, heard_s, snr_x4);
+    // ── Neighbours: zero-hop adverts from other REPEATERS only ───────────────
+    // (official putNeighbour). The appdata flags byte follows
+    // pubkey(32) + timestamp(4) + signature(64). Time stored = when WE heard it.
+    if (ptype == PAYLOAD_ADVERT && hop_count == 0 && payload_len > 100
+        && (payload_ptr[100] & 0x0F) == ADV_TYPE_REPEATER
+        && memcmp(payload_ptr, own_pubkey, 32) != 0) {
+        neighbor_add(payload_ptr, uptime_secs(), (int8_t)(radio.getSNR() * 4.0f));
+    }
+
+    // ── TRACE (direct): payload = tag(4) auth(4) flags(1) hashes[...] ────────
+    // The path field collects one SNR byte per hop so far. Forward if the hash
+    // at position <hops so far> is ours, appending our SNR (official Mesh.cpp).
+    if (direct && ptype == PAYLOAD_TYPE_TRACE) {
+        if (!cfg.repeat_en || payload_len < 9 || hs_code != 0 || hop_count >= 63) return false;
+        uint8_t path_sz = payload_ptr[8] & 0x03;     // trace hash size = 1 << path_sz
+        int hsz        = 1 << path_sz;
+        int hashes_len = payload_len - 9;
+        int offset     = hop_count << path_sz;
+        if (offset + hsz > hashes_len) return false;                    // end of trace (not for a repeater)
+        if (memcmp(payload_ptr + 9 + offset, own_pubkey, hsz) != 0) return false;   // not our turn
+        if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len, hop_count)) {
+            stat_direct_dups++; dlog("Drop dedup"); return false;
         }
+        if (len + 1 > 255) return false;
+        memcpy(relay_buf, data, ph);                 // header (+ transport codes)
+        relay_len = ph;
+        relay_buf[relay_len++] = (uint8_t)(hop_count + 1);
+        memcpy(relay_buf + relay_len, path_ptr, hop_count); relay_len += hop_count;
+        relay_buf[relay_len++] = (uint8_t)(int8_t)(radio.getSNR() * 4.0f);
+        memcpy(relay_buf + relay_len, payload_ptr, payload_len); relay_len += payload_len;
+        uint32_t tag; memcpy(&tag, payload_ptr, 4);
+        slog("Trace %08lX hop %u", (unsigned long)tag, (unsigned)(hop_count + 1));
+        relay_delay_x10 = cfg.direct_txdelay_x10;
+        return true;
     }
 
     // ── Mesh-admin packets addressed to us (dest_hash == own_hash) ──────────
-    // Handled (or dropped) here; never relayed. Packets not addressed to us fall
-    // through and are relayed normally (propagating a login to other repeaters).
-    if (ptype == PAYLOAD_TYPE_ANON_REQ || ptype == PAYLOAD_TYPE_TXT_MSG || ptype == PAYLOAD_TYPE_RESPONSE || ptype == PAYLOAD_TYPE_REQ) {
-        // Verbose trace of admin packets (USB only): dst/src, whether addressed to us.
-        if (ptype == PAYLOAD_TYPE_ANON_REQ)
-            dlog("ANON dst=%02X own=%02X hc=%d %s", payload_ptr[0], own_hash, hop_count, payload_ptr[0]==own_hash?"US":"relay");
-        else if (ptype == PAYLOAD_TYPE_TXT_MSG && payload_len >= 2)
-            dlog("TXM  dst=%02X src=%02X own=%02X hc=%d %s", payload_ptr[0], payload_ptr[1], own_hash, hop_count, payload_ptr[0]==own_hash?"US":"relay");
-        else if (ptype == PAYLOAD_TYPE_REQ && payload_len >= 2)
-            dlog("REQ  dst=%02X src=%02X own=%02X hc=%d %s", payload_ptr[0], payload_ptr[1], own_hash, hop_count, payload_ptr[0]==own_hash?"US":"relay");
-        if (payload_len >= 2 && payload_ptr[0] == own_hash) {
-            // Record + dedup the addressed-to-us packet. This block returns
-            // before the flood-relay dedup below, so without this a re-relayed
-            // copy of a command (same payload -> same fingerprint) that loops
-            // back through another repeater would be reprocessed, re-sending the
-            // reply — the duplicate the companion was seeing.
-            if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
-                dlog("Drop dedup");
-                return false;
-            }
-            if (ptype == PAYLOAD_TYPE_ANON_REQ) handle_anon_req(payload_ptr, payload_len);
-            else if (ptype == PAYLOAD_TYPE_TXT_MSG) handle_txt_msg(payload_ptr, payload_len);
-            else if (ptype == PAYLOAD_TYPE_REQ) handle_req(payload_ptr, payload_len);
+    // Only when we are the final recipient: any flood, or a direct packet whose
+    // path is used up (a direct packet still carrying hops belongs to them).
+    bool seen = false;   // already run through dedup_seen below
+    if ((ptype == PAYLOAD_TYPE_ANON_REQ || ptype == PAYLOAD_TYPE_TXT_MSG ||
+         ptype == PAYLOAD_TYPE_RESPONSE || ptype == PAYLOAD_TYPE_REQ)
+        && payload_len >= 2 && payload_ptr[0] == own_hash && (!direct || hop_count == 0)) {
+        dlog("ADM p=%d dst=%02X src=%02X hc=%d", ptype, payload_ptr[0], payload_ptr[1], (int)hop_count);
+        // Dedup first: a re-relayed copy of a command looping back through
+        // another repeater must not be reprocessed (duplicate replies).
+        if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
+            dlog("Drop dedup");
             return false;
         }
+        seen = true;
+        bool ours = false;
+        if      (ptype == PAYLOAD_TYPE_ANON_REQ) ours = handle_anon_req(payload_ptr, payload_len);
+        else if (ptype == PAYLOAD_TYPE_TXT_MSG)  ours = handle_txt_msg(payload_ptr, payload_len);
+        else if (ptype == PAYLOAD_TYPE_REQ)      ours = handle_req(payload_ptr, payload_len);
+        if (ours) return false;   // for us: never relayed
+        // Not decryptable: it's for another node sharing our 1-byte hash —
+        // relay it like any other packet (official routeRecvPacket).
     }
 
     // ── DIRECT routing ────────────────────────────────────────────────────────
-    // Re-transmit packet UNCHANGED if our hash appears anywhere in the path.
-    // (MeshCore reference: repeater.py _handle_direct)
-    if (route == ROUTE_DIRECT || route == ROUTE_TRANSPORT_DIRECT) {
-        if (path_contains_own(path_ptr, hop_count, hash_size)) {
-            if (len > MAX_PKT) return false;
-            relay_len = len;
-            memcpy(relay_buf, data, len);
-
-            if (dedup_seen(relay_buf, ptype, (uint8_t)relay_len)) {
-                stat_direct_dups++;
-                dlog("Drop dedup");
-                return false;
-            }
-
-            dlog("Relay direct");
-            return true;   // relay_is_flood stays false → no backoff
+    // Forward only if we are the NEXT hop (first path hash), with ourselves
+    // removed from the front of the path (official removeSelfFromPath).
+    if (direct) {
+        if (hop_count == 0) return false;   // zero-hop: for neighbours only, never relayed
+        if (!cfg.repeat_en) { dlog("Drop: repeat off"); return false; }
+        if (memcmp(path_ptr, own_pubkey, hash_size) != 0) return false;   // not our hop
+        if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
+            stat_direct_dups++;
+            dlog("Drop dedup");
+            return false;
         }
-        if ((ptype == PAYLOAD_TYPE_TRACE) && (own_hash == data[len-1])) {  // PING packet
-            if ((payload_len != 10)) return false; // Is it fixed length?
-            uint32_t ping_id;
-            memcpy(&ping_id, payload_ptr, 4);
-            relay_len = 0;
-            relay_buf[relay_len++] = ROUTE_DIRECT | (PAYLOAD_TYPE_TRACE<<2);
-            relay_buf[relay_len++] = 0x01;
-            relay_buf[relay_len++] = (int8_t)(radio.getSNR() * 4.0f);
-            memcpy(relay_buf + relay_len, payload_ptr, payload_len);
-            relay_len += payload_len;
-            slog("Ping: %08lX", (unsigned long)ping_id);
-            return true;   // relay_is_flood stays false → no backoff
-        }
-        return false;   // Our hash not in path — not our route
+        memcpy(relay_buf, data, ph);                 // header (+ transport codes)
+        relay_len = ph;
+        relay_buf[relay_len++] = (uint8_t)((hop_count - 1) | (hs_code << 6));
+        memcpy(relay_buf + relay_len, path_ptr + hash_size, path_bytes - hash_size);
+        relay_len += path_bytes - hash_size;
+        memcpy(relay_buf + relay_len, payload_ptr, payload_len);
+        relay_len += payload_len;
+        dlog("Relay direct");
+        relay_delay_x10 = cfg.direct_txdelay_x10;
+        return true;
     }
 
     // ── FLOOD routing (ROUTE_FLOOD 0x01 + ROUTE_TRANSPORT_FLOOD 0x00) ────────
@@ -1139,13 +1218,11 @@ static bool process_pkt(const uint8_t* data, int len) {
     // Guard: relay disabled via CLI (`set repeat off`)
     if (!cfg.repeat_en) { dlog("Drop: repeat off"); return false; }
 
-    // Guard: max hops
-    if (hop_count >= (cfg.flood_max ? cfg.flood_max : MAX_HOPS)) {
+    // Guard: max hops, and room to append our hash (path <= 64 B, count <= 63)
+    if (hop_count >= (cfg.flood_max ? cfg.flood_max : MAX_HOPS) || hop_count >= 63
+        || path_bytes + hash_size > MAX_PATH_SIZE) {
         dlog("Drop: max hops"); return false;
     }
-
-    // Guard: payload sanity
-    if (payload_len < 1) { dlog("Drop: malformed"); return false; }
 
     // PATH (0x08) addressed to us: a returned-path request to us, not relevant
     // to a repeater. Do NOT relay it — the relay's 300-800 ms CSMA backoff blocks
@@ -1156,34 +1233,20 @@ static bool process_pkt(const uint8_t* data, int len) {
         return false;
     }
 
-    // Self-pickup guard: with a detached / weak antenna we can RX our own TX.
-    // A few bits flip in transit, so the payload (and fingerprint) differ from
-    // the markSeen'd original — the dedup misses it and we'd relay our own
-    // reply. If an admin packet's src is us, it's our own transmission: drop
-    // it (and hex-dump it so we can confirm it's a corrupted self-pickup).
-    if ((ptype == PAYLOAD_TYPE_TXT_MSG || ptype == PAYLOAD_TYPE_ANON_REQ || ptype == PAYLOAD_TYPE_RESPONSE)
-        && payload_len >= 2 && payload_ptr[1] == own_hash) {
-        dlog("Drop self-pickup");
-#ifdef SP_DUMP_PAYLOAD        
-        hex_dump(payload_ptr, payload_len, 24);
-#endif        
-        return false;
-    }
-
     // Dedup check
-    if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
+    if (!seen && dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
         stat_flood_dups++;
         dlog("Drop dedup");
-#ifdef SP_DUMP_PAYLOAD        
+#ifdef SP_DUMP_PAYLOAD
         hex_dump(payload_ptr, payload_len, 24);
-#endif        
+#endif
         return false;
     }
 
     // Loop detection (off = skip; minimal/moderate/strict all drop when our
     // full hash appears in the path — compared across all hash_size bytes so
     // multi-byte paths don't false-positive on a first-byte collision)
-    if (cfg.loop_detect != 0 && path_contains_own(path_ptr, hop_count, hash_size)) {
+    if ((cfg.loop_detect & 0x03) != 0 && path_contains_own(path_ptr, hop_count, hash_size)) {
         dlog("Drop loop");
 #ifdef SP_DUMP_PAYLOAD
         hex_dump(payload_ptr, payload_len, 24);
@@ -1191,34 +1254,21 @@ static bool process_pkt(const uint8_t* data, int len) {
         return false;
     }
 
-    // Build relay packet
-    relay_len = 0;
-    relay_buf[relay_len++] = header;
-
-    // New path header: hop_count+1 with same hash_size_code
+    // Build relay packet: header (+ transport codes), hop_count+1, path + own hash, payload
+    if (len + hash_size > 255) { dlog("Drop too large"); return false; }
+    memcpy(relay_buf, data, ph);
+    relay_len = ph;
     uint8_t new_hop = hop_count + 1;
-    relay_buf[relay_len++] = (uint8_t)((new_hop & 0x3F) | (hs_code << 6));
-
-    // Old path hashes
-    if (relay_len + path_bytes + hash_size + payload_len >= MAX_PKT) {
-        dlog("Drop too large");
-        return false;
-    }
+    relay_buf[relay_len++] = (uint8_t)(new_hop | (hs_code << 6));
     memcpy(relay_buf + relay_len, path_ptr, path_bytes);
     relay_len += path_bytes;
-
-    // Append own hash (1..4 bytes depending on hash_size_code)
-    relay_buf[relay_len++] = own_hash;
-    if (hash_size >= 2) relay_buf[relay_len++] = own_pubkey[1];
-    if (hash_size >= 3) relay_buf[relay_len++] = own_pubkey[2];
-    if (hash_size >= 4) relay_buf[relay_len++] = own_pubkey[3];
-
-    // Payload
+    memcpy(relay_buf + relay_len, own_pubkey, hash_size);   // own hash (1..3 bytes)
+    relay_len += hash_size;
     memcpy(relay_buf + relay_len, payload_ptr, payload_len);
     relay_len += payload_len;
 
     dlog("Relay hop=%u", (unsigned)new_hop);
-    relay_is_flood = true;   // flood relay → apply the retransmit backoff
+    relay_delay_x10 = cfg.txdelay_x10;   // flood relay → txdelay backoff
     return true;
 }
 
@@ -1353,7 +1403,13 @@ void setup(void) {
     prefs_load();
     cli_begin();
 
+    // Clock: build time, or the backed-up clock if a reset (not power loss)
+    // happened after a later time was known (+1 s so timestamps never repeat).
     ts_base = build_unix_ts();
+    {
+        uint32_t saved = bkp_restore_time();
+        if (saved >= ts_base) ts_base = saved + 1;
+    }
     identity_init();
     rng_seed_uid();   // per-chip retransmit-delay RNG (see send_pkt)
     Serial1.println();
@@ -1430,9 +1486,12 @@ void cli_dfu(void) {
 }
 #endif
 
-uint32_t cli_now_epoch(void) { return ts_base + millis() / 1000UL; }
+uint32_t cli_now_epoch(void) { return now_epoch(); }
 
-void cli_set_time(uint32_t epoch) { ts_base = epoch - millis() / 1000UL; }
+void cli_set_time(uint32_t epoch) {
+    ts_base = epoch - uptime_secs();
+    bkp_save_time(epoch);
+}
 
 const char* cli_version_str(void) {
     static char buf[32];
@@ -1452,10 +1511,23 @@ void cli_send_advert_now(bool zero_hop) {
     }
 }
 
+// Build, sign and send our advert. zero_hop → neighbours only (not relayed).
+static void send_advert(bool zero_hop, const char* why) {
+    rx_started = false;   // restart RX after TX
+    uint8_t abuf[MAX_PKT];
+    int     alen = build_advert(abuf, zero_hop);
+    stat_advert++;
+    slog("ADVERT %s", why);
+    digitalWrite(PIN_LED, LED_ON);
+    send_pkt(abuf, alen, 0);
+    digitalWrite(PIN_LED, LED_OFF);
+}
+
 // ─── STOP Mode Manager ──────────────────────────────────────────────────────
 void loop(void) {
     IWatchdog.reload();
     uint32_t now = millis();
+    uptime_secs();   // tick the 64-bit uptime accumulator (must run < every 49 days)
 
     // ── CLI (USB serial) ─────────────────────────────────────────────────────
     cli_poll();   // ALWAYS polled, even in degraded mode, so serial is never bricked
@@ -1485,8 +1557,9 @@ void loop(void) {
     // ── ALIVE log line every 60 s (keeps the remote log ring uncluttered) ─────
     if (now - last_alive_ms >= 60000UL) {
         last_alive_ms = now;
+        bkp_save_time(now_epoch());   // keep the reset-surviving clock fresh
         slog("ALIVE up=%lus rx=%lu relay=%lu drop=%lu",
-             (unsigned long)(now / 1000),
+             (unsigned long)uptime_secs(),
              (unsigned long)stat_rx, (unsigned long)stat_relay, (unsigned long)stat_drop);
     }
 
@@ -1509,15 +1582,7 @@ void loop(void) {
     // ── CLI-triggered advert ─────────────────────────────────────────────────
     if (advert_pending) {
         advert_pending = false;
-        rx_started = false;
-        rf_idle();
-        uint8_t abuf[MAX_PKT];
-        int     alen = build_advert(abuf);
-        stat_advert++;
-        slog("ADVERT %s", advert_zerohop ? "zerohop" : "flood");
-        digitalWrite(PIN_LED, LED_ON);
-        send_pkt(abuf, alen, false);
-        digitalWrite(PIN_LED, LED_OFF);
+        send_advert(advert_zerohop, advert_zerohop ? "zerohop" : "flood");
         last_local_advert = now;   // don't double-send right after
     }
 
@@ -1525,15 +1590,7 @@ void loop(void) {
     if (discovery_burst && (now - last_burst_ms) >= DISCOVERY_INTERVAL_MS) {
         last_burst_ms = now;
         discovery_burst--;
-        rx_started = false;
-        rf_idle();
-        uint8_t abuf[MAX_PKT];
-        int     alen = build_advert(abuf);
-        stat_advert++;
-        slog("ADVERT discover %u", (unsigned)discovery_burst);
-        digitalWrite(PIN_LED, LED_ON);
-        send_pkt(abuf, alen, false);
-        digitalWrite(PIN_LED, LED_OFF);
+        send_advert(true, "discover");
     }
 
     // ── ADVERT timers (intervals from cfg, MeshCore standard) ────────────────
@@ -1541,6 +1598,7 @@ void loop(void) {
     uint32_t flood_iv  = (uint32_t)cfg.flood_advert_h * 3600UL * 1000UL;
 
     bool do_advert = false;
+    bool advert_zero = false;
     const char* advert_type = "";
 
     // First ADVERT at boot (flood)
@@ -1563,20 +1621,11 @@ void loop(void) {
              (now - last_local_advert) >= local_iv) {
         do_advert = true;
         last_local_advert = now;
+        advert_zero = true;          // periodic local advert = zero-hop
         advert_type = "local";
     }
 
-    if (do_advert) {
-        rx_started = false;  // restart RX after TX
-        rf_idle();
-        uint8_t abuf[MAX_PKT];
-        int     alen = build_advert(abuf);
-        stat_advert++;
-        slog("ADVERT %s", advert_type);
-        digitalWrite(PIN_LED, LED_ON);
-        send_pkt(abuf, alen, false);
-        digitalWrite(PIN_LED, LED_OFF);
-    }
+    if (do_advert) send_advert(advert_zero, advert_type);
 
     // ── Interrupt-driven receive (DIO1/PC15 fires on RxDone) ─────────────────
     // DIO1 is connected to PC15 on this HW revision, so we use setDio1Action()
@@ -1584,7 +1633,6 @@ void loop(void) {
     // rx_flag; here we react to it. startReceive() arms the radio; on RxDone the
     // ISR fires, we read the packet, and re-arm.
     if (!rx_started) {
-        rf_rx();
         int err = radio.startReceive();
         if (err != RADIOLIB_ERR_NONE) {
             slog("startReceive err: %d", (int)err);
@@ -1601,10 +1649,10 @@ void loop(void) {
         if (state == RADIOLIB_ERR_NONE) {
             int   rxlen = (int)radio.getPacketLength();
             float rssi  = radio.getRSSI();
-            int   snr   = (int)radio.getSNR();
+            float snr   = radio.getSNR();
             rxlog("RX RSSI=%d SNR=%d len=%d", (int)rssi, (int)snr, (int)rxlen);
             stat_last_rssi   = (int16_t)rssi;          // last RX signal level
-            stat_last_snr_x4 = (int16_t)(snr * 4);     // last SNR, x4
+            stat_last_snr_x4 = (int16_t)(snr * 4.0f);  // last SNR, x4 (keep the fraction)
             stat_rx_air_ms  += (uint32_t)(radio.getTimeOnAir(rxlen) / 1000);   // per-packet RX air time
             if (rxlen > 0 && rxlen < MAX_PKT) {
                 stat_rx++;
@@ -1612,11 +1660,10 @@ void loop(void) {
                 if (route == ROUTE_DIRECT || route == ROUTE_TRANSPORT_DIRECT) stat_recv_direct++;
                 else                                                          stat_recv_flood++;
                 led_blink(1, 20);         // 1 blink = pkt received
-                rf_idle();
                 if (process_pkt(rxbuf, rxlen)) {
                     stat_relay++;
                     led_blink(2, 20);     // 2 fast blinks = relay OK
-                    send_pkt(relay_buf, relay_len, relay_is_flood);
+                    send_pkt(relay_buf, relay_len, relay_delay_x10);
                 } else {
                     stat_drop++;
                 }
@@ -1669,6 +1716,11 @@ void loop(void) {
                 if (nf_samples > 0) {
                     stat_noise_floor = (int16_t)(nf_sum / nf_samples);
                     if (stat_noise_floor < -120) stat_noise_floor = -120;
+                } else {
+                    // Every sample was > floor + 14 dB: the floor has risen for
+                    // good. Reset so the next session reconverges instead of
+                    // staying stuck (the official resets its floor similarly).
+                    stat_noise_floor = 0;
                 }
                 nf_session_active = false;
             }

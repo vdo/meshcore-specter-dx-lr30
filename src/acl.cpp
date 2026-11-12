@@ -10,32 +10,24 @@ AclEntry* acl_by_pub(const uint8_t* pub) {
     return 0;
 }
 
-AclEntry* acl_by_hash(uint8_t hash) {
-    // 1-byte hashes: match active entries whose pub[0] == hash
-    for (int i = 0; i < ACL_MAX; i++)
-        if (entries[i].active && entries[i].pub[0] == hash)
-            return &entries[i];
-    return 0;
-}
-
-AclEntry* acl_add(const uint8_t* pub, uint8_t perms, const uint8_t* secret) {
+AclEntry* acl_add(const uint8_t* pub) {
     AclEntry* e = acl_by_pub(pub);
-    if (!e) {
-        for (int i = 0; i < ACL_MAX; i++) {
-            if (!entries[i].active) {
-                e = &entries[i];
-                e->active = 1;
-                e->last_ts = 0;
-                e->last_activity_ms = 0;
-                break;
-            }
-        }
-        if (!e) return 0;   // table full
+    if (e) return e;
+    AclEntry* victim = 0;
+    for (int i = 0; i < ACL_MAX; i++) {
+        AclEntry* c = &entries[i];
+        if (!c->active) { victim = c; break; }
+        // prefer the oldest non-admin; fall back to the oldest admin
+        bool c_better = !victim
+            || (victim->perms == PERM_ADMIN && c->perms != PERM_ADMIN)
+            || ((victim->perms == PERM_ADMIN) == (c->perms == PERM_ADMIN)
+                && (int32_t)(c->last_activity_ms - victim->last_activity_ms) < 0);
+        if (c_better) victim = c;
     }
-    memcpy(e->pub, pub, ACL_PUBKEY);
-    e->perms = perms;
-    if (secret) memcpy(e->secret, secret, ACL_SECRET);
-    return e;   // caller sets last_ts / last_activity_ms
+    memset(victim, 0, sizeof(*victim));
+    memcpy(victim->pub, pub, ACL_PUBKEY);
+    victim->active = 1;
+    return victim;
 }
 
 void acl_remove_pub(const uint8_t* pub) {

@@ -203,7 +203,10 @@ static int parse_micro(const char* s, int32_t* out) {
     const char* p = s;
     if (*p < '0' || *p > '9') return -1;
     int32_t ip = 0;
-    while (*p >= '0' && *p <= '9') { ip = ip * 10 + (*p - '0'); p++; }
+    while (*p >= '0' && *p <= '9') {
+        ip = ip * 10 + (*p - '0'); p++;
+        if (ip > 2000) return -1;   // ip * 1e6 must fit int32 (no caller needs > 2000)
+    }
     int32_t frac = 0;
     int nd = 0;
     if (*p == '.') {
@@ -344,8 +347,21 @@ static void cmd_time(int argc, char** argv) {
         out("Err: bad epoch");
         return;
     }
+    // Official: the clock never goes backwards — peers would drop our next
+    // adverts as replays (their timestamp would be older than one already seen).
+    if ((uint32_t)v <= cli_now_epoch()) { out("Err: clock cannot go backwards"); return; }
     cli_set_time((uint32_t)v);
     out("OK");
+}
+
+// `clock sync` (mesh admin): set our clock from the admin's message timestamp,
+// forward only (official CommonCLI).
+static uint32_t cli_sender_ts = 0;
+static void cmd_clock_sync(void) {
+    if (cli_sender_ts == 0) { out("Err: clock sync works over the mesh only (use: time <epoch>)"); return; }
+    if (cli_sender_ts <= cli_now_epoch()) { out("Err: clock cannot go backwards"); return; }
+    cli_set_time(cli_sender_ts + 1);
+    out("OK - clock set");
 }
 
 static void cmd_advert(int argc, char** argv) {
@@ -362,7 +378,7 @@ static void cmd_neighbors(void) {
     memset(done, 0, sizeof(done));
     int    pos   = 0;
     bool   first = true;
-    uint32_t now_s = millis() / 1000UL;
+    uint32_t now_s = uptime_secs();
     for (int r = 0; r < NEIGH_MAX; r++) {
         int best = -1;
         for (int i = 0; i < NEIGH_MAX; i++) {
@@ -389,9 +405,9 @@ extern uint32_t get_tx_budget_ms(void);
 static void cmd_stats_core(void) {
     char buf[100];
     snprintf(buf, sizeof(buf), "uptime=%lus name=%s duty=%u%% budget=%lums loop.detect=%s",
-             (unsigned long)(millis() / 1000), cfg.name,
+             (unsigned long)uptime_secs(), cfg.name,
              (unsigned)cfg.dutycycle, (unsigned long)get_tx_budget_ms(),
-             cfg.loop_detect ? "on" : "off");
+             (cfg.loop_detect & 0x03) ? "on" : "off");   // bits [3:2] = path.hash.mode
     out(buf);
 }
 
@@ -492,7 +508,7 @@ static bool parse_radio(const char* s, uint32_t* khz, uint16_t* bw,
     if (f_mhz < 150000000 || f_mhz > 960000000) return false;    // 150–960 MHz (SX1262)
     if (b_khz_tenth < 7800000 || b_khz_tenth > 500000000) return false; // 7.8–500 kHz
     if (sfi < 5 || sfi > 12) return false;                        // SF 5–12
-    if (cri < 4 || cri > 8)  return false;                        // CR 4–8 (SX1262)
+    if (cri < 5 || cri > 8)  return false;                        // CR 5–8 (4/5..4/8, RadioLib)
     *khz = (uint32_t)(f_mhz / 1000);                          // micro-MHz → kHz
     *bw  = (uint16_t)(b_khz_tenth / 100000);                  // micro-kHz → kHz×10
     *sf  = (uint8_t)sfi;
@@ -528,7 +544,7 @@ static void set_freq(int argc, char** argv) {
     if (argc < 3) { out("Err: usage: set freq <MHz>"); return; }
     int32_t f_mhz;
     if (parse_micro(argv[2], &f_mhz) ||
-        f_mhz < 300000000 || f_mhz > 2500000000) {
+        f_mhz < 150000000 || f_mhz > 960000000) {          // SX1262: 150–960 MHz
         out("Err: bad frequency");
         return;
     }
@@ -779,7 +795,11 @@ static void handle_line(char* raw) {
     else if (!strcmp(c, "dfu"))                             { cli_dfu(); }
 #endif
     else if (!strcmp(c, "erase"))                           { cmd_erasectl(); }
-    else if (!strcmp(c, "clock"))                           { FINISH(cmd_clock()); }
+    else if (!strcmp(c, "clock")) {
+        if (argc >= 2 && !strcmp(argv[1], "sync")) cmd_clock_sync();
+        else                                       cmd_clock();
+        done = true;
+    }
     else if (!strcmp(c, "neighbors"))                       { FINISH(cmd_neighbors()); }
     else if (!strcmp(c, "log")) {
         if (argc >= 2 && !strcmp(argv[1], "start")) {
@@ -817,7 +837,7 @@ static void handle_line(char* raw) {
     // "get <thing>"
     else if (!strcmp(c, "get")) {
         done = true;   // all get/set paths print the prompt afterwards
-        if (argc < 2) { out("Err: usage: get <name|lat|lon|radio|freq|tx|public.key|role|...>"); }
+        if (argc < 2) { out("Err: usage: get <name|lat|lon|radio|freq|tx|public.key|role|...>"); return; }
         const char* g = argv[1];
         if      (!strcmp(g, "name"))        get_name();
         else if (!strcmp(g, "role"))        cmd_role();
@@ -850,7 +870,7 @@ static void handle_line(char* raw) {
     // "set <thing> ..."
     else if (!strcmp(c, "set")) {
         done = true;
-        if (argc < 2) { out("Err: usage: set <what> <value>"); }
+        if (argc < 2) { out("Err: usage: set <what> <value>"); return; }
         const char* s = argv[1];
         if      (!strcmp(s, "name"))                set_name(argc, argv);
         else if (!strcmp(s, "lat"))                 set_coord(argc, argv, 1);
@@ -892,14 +912,16 @@ static void handle_line(char* raw) {
 // Run a CLI command, capturing its reply into outbuf (for mesh-admin). Returns
 // the reply length. handle_line() is reused; its output helpers divert to the
 // capture buffer while cap_buf is set.
-int cli_execute(const char* cmd, char* outbuf, int outsize) {
+int cli_execute(const char* cmd, char* outbuf, int outsize, uint32_t sender_ts) {
     static char line[72];   // static: keep the 1 KB stack small
     int n = (int)strlen(cmd);
     if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
     memcpy(line, cmd, n); line[n] = '\0';
     outbuf[0] = '\0';
     cap_buf = outbuf; cap_len = 0; cap_size = outsize;
+    cli_sender_ts = sender_ts;
     handle_line(line);
+    cli_sender_ts = 0;
     cap_buf = 0;
     return cap_len;
 }

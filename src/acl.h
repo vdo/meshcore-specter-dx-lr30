@@ -30,9 +30,11 @@ typedef struct {
     uint32_t last_ts;              // their clock (login replay guard)
 } AclEntry;
 
-AclEntry*      acl_by_hash(uint8_t hash);            // active entry with pub[0]==hash
 AclEntry*      acl_by_pub(const uint8_t* pub);       // active entry by full pubkey
-AclEntry*      acl_add(const uint8_t* pub, uint8_t perms, const uint8_t* secret);
+// Existing entry for pub, else a free slot, else evicts the least-recently-active
+// non-admin (like the official ClientACL::putClient). A new/evicted entry comes
+// back zeroed (last_ts = 0); the caller sets perms/secret after its replay check.
+AclEntry*      acl_add(const uint8_t* pub);
 void           acl_remove_pub(const uint8_t* pub);
 void           acl_clear(void);
 int            acl_count(void);

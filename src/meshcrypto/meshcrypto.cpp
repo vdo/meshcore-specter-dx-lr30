@@ -58,11 +58,12 @@ int mesh_encrypt_then_mac(const uint8_t* secret, uint8_t* dest,
     return MESH_CIPHER_MAC_SIZE + enc_len;
 }
 
-int mesh_mac_then_decrypt(const uint8_t* secret, uint8_t* dest,
+int mesh_mac_then_decrypt(const uint8_t* secret, uint8_t* dest, int dest_size,
                           const uint8_t* src, int src_len) {
     if (src_len <= MESH_CIPHER_MAC_SIZE) return 0;         // no ciphertext
     int enc_len = src_len - MESH_CIPHER_MAC_SIZE;
     if (enc_len % MESH_CIPHER_BLOCK_SIZE != 0) return 0;   // not block-aligned
+    if (enc_len > dest_size) return 0;                     // would overflow dest
 
     uint8_t hmac[MESH_CIPHER_MAC_SIZE];
     {

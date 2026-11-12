@@ -4,6 +4,68 @@ All notable changes to SPECTER firmware are documented here.
 
 ## [Unreleased]
 
+### Fixes (verified against the official MeshCore firmware source)
+
+Security:
+- **Remote memory corruption**: a crafted login (ANON_REQ — the attacker picks the
+  key, so the MAC verifies) could decrypt up to 208 B into a 160 B buffer.
+  Decryption is now bounded; payloads > 184 B are dropped like the official.
+- **Guests could read the admin password** (`get admin.password` was READ). Anything
+  containing `password`, plus `time <epoch>`, `clock sync` and `log start|stop|clear`,
+  is now admin-only.
+- **Command replay**: REQ/TXT_MSG timestamps are checked *before* running (equal = a
+  retry, not re-run), so a captured `erase`/`reboot` can't be replayed.
+- **Session-table lockout**: a full table now evicts the least-recently-active
+  non-admin (official `putClient`); the login replay check runs before the entry
+  is modified.
+- `time` can no longer move the clock backwards (official rule).
+
+Protocol / routing:
+- **Own TX read back as RX**: DIO1 also fires on TxDone, so after every TX the loop
+  "received" its own packet from the radio buffer (the old "bit-flipped
+  self-pickup"). `rx_flag` is cleared after transmit; the self-pickup guard, which
+  also dropped packets from nodes sharing our 1-byte hash, is removed.
+- **Zero-hop adverts were flooded mesh-wide**: periodic local adverts, `advert
+  zerohop` and the discovery burst now go out as DIRECT with an empty path (official
+  `sendZeroHop`). Our own adverts are marked seen so echoes aren't re-relayed.
+- **Direct routing**: forward only when we are the *first* path hash, and remove
+  ourselves from the path (official `removeSelfFromPath`). Previously any position
+  matched and the path was left unchanged, breaking multi-hop direct routes.
+- **TRACE**: proper multi-hop forwarding (match the hash at `hops << path_sz`, append
+  our SNR) instead of the single-hop special case.
+- **Transport codes**: route types 0x00/0x03 carry 4 bytes before the path byte;
+  they were misparsed and region-scoped floods got corrupted when relayed.
+- `txdelay` / `direct.txdelay` are now applied: random delay in
+  `[0, 5 × airtime × factor]` (official). Direct relays used to get no delay.
+- Packets addressed to our 1-byte hash that we can't decrypt (another node with the
+  same hash) are now relayed instead of swallowed.
+- `set repeat off` now also stops direct and trace forwarding (official `disable_fwd`).
+- Neighbours list: zero-hop adverts from repeaters only (official), not every advert.
+- Path validation: reserved 4-byte hash code rejected, path ≤ 64 B, hop count can no
+  longer wrap from 63 to 0.
+- `loop.detect off` was ignored when `path.hash.mode` was non-zero (shared byte).
+
+Clock:
+- Uptime / advert clock no longer wraps at 49.7 days (64-bit ms accumulator).
+- The clock survives resets (watchdog, `reboot`, reset pin) via the STM32 backup
+  registers, so adverts after a reboot aren't rejected as replays. Lost on power-off.
+- New `clock sync` (mesh admin): set the clock from the admin's message timestamp.
+- The boot clock was ahead by the build machine's UTC offset (`__DATE__`/`__TIME__`
+  are local time but were read as UTC). It now uses the real UTC build time
+  (`-D BUILD_EPOCH=$UNIX_TIME` in platformio.ini).
+
+Other:
+- SX1262 current limit raised to 140 mA (RadioLib default 60 mA clipped output
+  above ~17 dBm), as MeshCore does.
+- Admin replies of 151–175 B were padded to 176 B with stale bytes from an earlier
+  reply.
+- `get`/`set` without an argument no longer call `strcmp(NULL, …)`; `set freq`
+  validates 150–960 MHz (was an int32 overflow); `set radio` CR range is 5–8.
+- SNR keeps its fractional part; a noise floor that rose for good now reconverges.
+- RF switch pins are left to RadioLib (`setRfSwitchPins`) instead of being
+  overridden by hand (which cut the RX path while packets were processed).
+- Build fails if the image would reach the prefs flash page.
+
 ### Performance
 
 - **Combined ADC sampling**: VREFINT (`ch17`) and the temp sensor (`ch16`) are now

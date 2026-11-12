@@ -100,7 +100,9 @@ void prefs_erase(void);   // clear flash page (factory reset)
 // ─── cli.cpp ────────────────────────────────────────────────────────────────
 void cli_begin(void);     // called in setup() after prefs_load()
 void cli_poll(void);      // non-blocking line reader, call in loop()
-int cli_execute(const char* cmd, char* outbuf, int outsize);  // run + capture reply (mesh-admin)
+// Run + capture reply (mesh-admin). sender_ts = the admin's message timestamp,
+// used by `clock sync` (0 = none, e.g. USB).
+int cli_execute(const char* cmd, char* outbuf, int outsize, uint32_t sender_ts);
 
 // Neighbor cache (8 most recent adverts), used by `neighbors`
 void neighbor_add(const uint8_t* pubkey32, uint32_t ts, int8_t snr_x4);
@@ -123,6 +125,7 @@ void cli_send_advert_now(bool zero_hop);
 void cli_set_rxgain(bool boosted);   // live setRxBoostedGainMode (no reboot)
 void cli_set_time(uint32_t epoch);
 uint32_t cli_now_epoch(void);
+uint32_t uptime_secs(void);          // seconds since boot, does not wrap at 49.7 days
 const char* cli_version_str(void);
 uint16_t measure_vdda_mv(void);      // clean analog supply (VDDA) in mV (VREFINT)
 uint16_t measure_battery_mv(void);   // pack voltage in mV = VDDA + Schottky drop

@@ -41,6 +41,7 @@ int mesh_encrypt_then_mac(const uint8_t *secret, uint8_t *dest,
 
 /* Verify the 2-byte MAC, then AES-ECB-decrypt the ciphertext into dest.
  * Returns the decrypted length (a multiple of 16; caller trims to the real
- * length), or 0 if the MAC does not match or the input is malformed. */
-int mesh_mac_then_decrypt(const uint8_t *secret, uint8_t *dest,
+ * length), or 0 if the MAC does not match, the input is malformed, or the
+ * plaintext would not fit in dest_size bytes. */
+int mesh_mac_then_decrypt(const uint8_t *secret, uint8_t *dest, int dest_size,
                           const uint8_t *src, int src_len);

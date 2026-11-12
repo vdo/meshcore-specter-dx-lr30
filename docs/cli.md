@@ -221,7 +221,8 @@ OK
 | `set temp.offset <-12..12>` | `OK` | **admin / local-serial only.** Zero the temp sensor against a reference thermometer (adds the offset to every reading); persists |
 | `get public.key` | 64 hex chars | Ed25519 pubkey |
 | `clock` | epoch seconds | advert timestamp base + uptime |
-| `time <epoch>` | `OK` | re-syncs advert clock (companions reject `\|now-ts\| > 3600 s`) |
+| `time <epoch>` | `OK` | re-syncs advert clock forward only (`Err: clock cannot go backwards` otherwise — peers would drop our adverts as replays). Admin over the mesh |
+| `clock sync` | `OK - clock set` | mesh admin only: sets the clock from the admin's message timestamp (forward only), like the official firmware |
 | `get name` / `set name <n>` | name / `OK` | 23 B max with location, 31 B without |
 | `get lat` / `set lat <deg>` | `52.520007` / `OK` | ±90°, 6 decimals; `0` = no location in advert |
 | `get lon` / `set lon <deg>` | `13.404954` / `OK` | ±180° |
@@ -335,7 +336,10 @@ over the mesh. Keep it ≤ 23 chars (longer is clipped to fit the field).
 | Password | Permission | Can do |
 |---|---|---|
 | `admin.password` | ADMIN | everything, incl. `set`, `reboot`, `erase`, `dfu`, and the calibration writes (`battery.charged`, `set battery.vref`, `set temp.offset`) |
-| `guest.password` | READ | `get` (incl. `get battery.vref`, `get temp.offset`), `ver`, `board`, `clock`, `time`, `stats-*`, `neighbors`, `log`, `acl` |
+| `guest.password` | READ | `get` (incl. `get battery.vref`, `get temp.offset`, but **not** `get admin.password` / `get guest.password`), `ver`, `board`, bare `clock`, `stats-*`, `neighbors`, bare `log`, `acl` |
+
+> Admin-only regardless of the generic rules: anything containing `password`, `time <epoch>`,
+> `clock sync`, and `log start|stop|clear`.
 
 > The calibration **writes** (`battery.charged`, `set battery.vref`, `set temp.offset`) are
 > ADMIN-gated even though `set …` normally needs only READWRITE and `battery …` only READ —
