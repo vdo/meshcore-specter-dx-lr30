@@ -35,6 +35,9 @@ All notable changes to SPECTER firmware are documented here.
 - `time` and `clock sync` may move the clock **backwards** again (the official
   forbids it), so a clock that ran ahead can always be corrected. Peers ignore our
   adverts until real time passes the newest timestamp they heard from us.
+- Answers the official anonymous clock query (`ANON_REQ` type 0x03, DIRECT only,
+  4 per 3 min) with `[tag][our clock][features]`. Before, it was treated as a bad
+  login password and ignored, so other nodes could not read our clock.
 
 ### Stats CLI
 

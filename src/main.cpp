@@ -47,6 +47,9 @@
 #define TXT_TYPE_CLI_DATA       1
 #define TXT_TYPE_CLI_COMMAND    3
 #define RESP_SERVER_LOGIN_OK    0
+#define ANON_REQ_TYPE_BASIC     0x03   // remote clock query (official)
+static uint32_t anon_win_s = 0;
+static uint8_t  anon_count = 0;
 
 // ─── Repeater stats (REQ_TYPE_GET_STATUS response) ───────────────────────────
 // Byte-exact port of the official simple_repeater RepeaterStats: 56 bytes,
@@ -807,6 +810,32 @@ static bool handle_anon_req(const uint8_t* pl, int plen) {
     uint8_t* data = dec_buf;
     uint32_t their_ts; memcpy(&their_ts, data, 4);
     const char* password = (const char*)(data + 4);
+
+    // Typed anon request (official: data[4] in 1..31, DIRECT only, 4 per 3 min).
+    // ponytail: only ANON_REQ_TYPE_BASIC (remote clock); REGIONS/OWNER get no
+    // reply, add them if clients need them.
+    if (data[4] != 0 && data[4] < ' ') {
+        if (data[4] != ANON_REQ_TYPE_BASIC || rx_ctx.flood || len < 6) return true;
+        uint8_t rpl = data[5];
+        int rpb = (rpl & 0x3F) * (((rpl >> 6) & 0x03) + 1);
+        if (((rpl >> 6) & 0x03) == 3 || rpb > MAX_PATH_SIZE || 6 + rpb > len) return true;
+        uint32_t now_s = uptime_secs();
+        if (now_s - anon_win_s >= 180) { anon_win_s = now_s; anon_count = 0; }
+        if (anon_count >= 4) return true;
+        anon_count++;
+        static AclEntry tmp;                       // reply target: supplied path, no session
+        memcpy(tmp.pub, sender_pub, sizeof(tmp.pub));
+        memcpy(tmp.secret, secret, sizeof(tmp.secret));
+        tmp.out_path_len = rpl;
+        memcpy(tmp.out_path, data + 6, rpb);
+        uint8_t r[9];
+        uint32_t now = now_epoch();
+        memcpy(r, &their_ts, 4);                   // sender ts as tag
+        memcpy(r + 4, &now, 4);                    // our clock
+        r[8] = cfg.repeat_en ? 0 : 0x80;           // features: 0x80 = forwarding disabled
+        admin_reply(&tmp, PAYLOAD_TYPE_RESPONSE, r, sizeof(r), false, SERVER_RESPONSE_DELAY);
+        return true;
+    }
 
     uint8_t perms = 0xFF;
     if (password[0] == 0) {
